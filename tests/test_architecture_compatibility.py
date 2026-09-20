@@ -191,10 +191,11 @@ def test_tiny_glm4_and_deepseek_v2_v3_run_all_calibrators():
 
 @pytest.mark.parametrize("method", ["gptq", "awq", "autoround"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("mlp_type", ["moe", "hash_moe"])
 @pytest.mark.parametrize("layer_type", [
     "sliding_attention", "compressed_sparse_attention", "heavily_compressed_attention",
 ])
-def test_tiny_deepseek_v4_preserves_forward_kwargs_and_runs_calibrators(method, layer_type, dtype):
+def test_tiny_deepseek_v4_preserves_forward_kwargs_and_runs_calibrators(method, layer_type, dtype, mlp_type):
     import transformers
 
     if not hasattr(transformers, "DeepseekV4Config"):
@@ -218,7 +219,7 @@ def test_tiny_deepseek_v4_preserves_forward_kwargs_and_runs_calibrators(method, 
             n_shared_experts=1,
             max_position_embeddings=512,
             layer_types=[layer_type],
-            mlp_layer_types=["moe"],
+            mlp_layer_types=[mlp_type],
             hc_mult=2,
             hc_sinkhorn_iters=2,
             o_groups=2,
@@ -235,6 +236,11 @@ def test_tiny_deepseek_v4_preserves_forward_kwargs_and_runs_calibrators(method, 
         for name, parameter in model.named_parameters():
             if any(part in strict for part in name.split('.')):
                 parameter.data = parameter.data.float()
+        if mlp_type == "hash_moe":
+            # Real checkpoints supply this table; the test model initializes
+            # it to zero, which would deliberately leave expert 1 unobserved.
+            table = model.model.layers[0].mlp.gate.tid2eid
+            table.copy_((torch.arange(config.vocab_size) % 2).unsqueeze(-1))
         return model
 
     torch.manual_seed(11)

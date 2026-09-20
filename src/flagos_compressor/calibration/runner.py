@@ -19,6 +19,7 @@ from flagos_compressor.calibration.modeling import (
     forward_layer_samples,
     move_to_device,
     prepare_forward_kwargs,
+    sanitize_kwargs,
 )
 from flagos_compressor.core.policy import QuantizationPolicy
 from flagos_compressor.inspect.tensor_classifier import classify_weight
@@ -185,7 +186,7 @@ def _forward_kwargs_for_submodule(
     samples: list[tuple[tuple[Any, ...], dict[str, Any]]],
     device: torch.device,
 ) -> dict[str, Any]:
-    """Collate attention kwargs alongside AWQ's concatenated feature batches."""
+    """Collate supported inputs alongside AWQ's concatenated feature batches."""
     batch_sizes = [args[0].shape[0] for args, _kwargs in samples]
 
     def merge(values):
@@ -199,7 +200,7 @@ def _forward_kwargs_for_submodule(
             ):
                 return torch.cat(values, dim=0)
             if not all(torch.equal(first, value) for value in values):
-                raise ValueError("AWQ cannot batch unequal non-batched attention kwargs")
+                raise ValueError("AWQ cannot batch unequal non-batched forward kwargs")
             return first
         if isinstance(first, dict):
             return {key: merge([value[key] for value in values]) for key in first}
@@ -208,7 +209,7 @@ def _forward_kwargs_for_submodule(
         return first
 
     kwargs = {}
-    for key in samples[0][1]:
+    for key in sanitize_kwargs(module, samples[0][1]):
         values = [sample_kwargs[key] for _args, sample_kwargs in samples]
         # Capture occurs before the first decoder block, so these caches are
         # empty. Each replay allocates its own batched cache lazily.
@@ -654,11 +655,9 @@ def quantize_layer_awq(
         search_linears = [linears[name] for name in mapping.quantized_names]
         balance = [modules[name] for name in mapping.linear_names]
         inspect_module = modules[mapping.inspect_name]
-        kwargs = (
-            _forward_kwargs_for_submodule(inspect_module, samples, device)
-            if mapping.inspect_name.rsplit(".", 1)[-1] in {"self_attn", "attention", "attn", "linear_attn"}
-            else {}
-        )
+        # DeepSeek V4's first MoE blocks need input_ids for hash routing.
+        # Signature filtering keeps plain Linear calls free of model kwargs.
+        kwargs = _forward_kwargs_for_submodule(inspect_module, samples, device)
         scales = search_awq_scale(
             inspect_module,
             search_linears,
