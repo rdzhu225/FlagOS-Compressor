@@ -72,6 +72,7 @@ def _run_calibrated(args, policy) -> None:
             samples,
             policy,
             device=device,
+            report_path=Path(args.output) / "calibration_report.json",
         )
         autoround_config = None
         if policy.method == "autoround":

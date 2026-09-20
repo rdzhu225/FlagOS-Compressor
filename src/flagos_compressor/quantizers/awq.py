@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -117,7 +119,14 @@ def search_awq_scale(
     weight_mean = normalized.view(original_shape).mean(dim=0).float()
     input_mean = inputs.detach().abs().reshape(-1, inputs.shape[-1]).float().mean(dim=0)
 
-    reference = _first_tensor(module(inputs, **kwargs)).detach()
+    def replay():
+        call_kwargs = dict(kwargs)
+        for name in ("past_key_values", "past_key_value"):
+            if call_kwargs.get(name) is not None:
+                call_kwargs[name] = copy.deepcopy(call_kwargs[name])
+        return _first_tensor(module(inputs, **call_kwargs))
+
+    reference = replay().detach()
     original_weights = [linear.weight.detach().clone() for linear in linears]
     best_error = float("inf")
     best_scales: torch.Tensor | None = None
@@ -146,7 +155,7 @@ def search_awq_scale(
                     ).weight
                     / scale_view
                 )
-            candidate = _first_tensor(module(inputs, **kwargs))
+            candidate = replay()
             error = _mse_chunked(reference, candidate, max_chunk_memory)
             if error < best_error:
                 best_error = error
