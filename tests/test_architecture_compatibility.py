@@ -9,6 +9,7 @@ from flagos_compressor.calibration.modeling import (
     capture_first_layer_inputs,
     decoder_layers,
     sanitize_kwargs,
+    preserve_norm_activation_dtype,
 )
 from flagos_compressor.calibration.moe import linearize_fused_experts
 from flagos_compressor.calibration.runner import (
@@ -37,6 +38,7 @@ def _policy(method: str) -> QuantizationPolicy:
 
 def _run_tiny_model(model, method: str, sequence_length: int = 8) -> dict:
     linearize_fused_experts(model)
+    preserve_norm_activation_dtype(model)
     layers = decoder_layers(model)
     batches = [
         {
@@ -188,10 +190,11 @@ def test_tiny_glm4_and_deepseek_v2_v3_run_all_calibrators():
 
 
 @pytest.mark.parametrize("method", ["gptq", "awq", "autoround"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("layer_type", [
     "sliding_attention", "compressed_sparse_attention", "heavily_compressed_attention",
 ])
-def test_tiny_deepseek_v4_preserves_forward_kwargs_and_runs_calibrators(method, layer_type):
+def test_tiny_deepseek_v4_preserves_forward_kwargs_and_runs_calibrators(method, layer_type, dtype):
     import transformers
 
     if not hasattr(transformers, "DeepseekV4Config"):
@@ -226,7 +229,13 @@ def test_tiny_deepseek_v4_preserves_forward_kwargs_and_runs_calibrators(method, 
             num_nextn_predict_layers=0,
             use_cache=False,
         )
-        return DeepseekV4ForCausalLM(config).eval()
+        model = DeepseekV4ForCausalLM(config).eval().to(dtype)
+        # Reproduce from_pretrained's strict FP32 exclusions with A16 linears.
+        strict = set(model._keep_in_fp32_modules_strict)
+        for name, parameter in model.named_parameters():
+            if any(part in strict for part in name.split('.')):
+                parameter.data = parameter.data.float()
+        return model
 
     torch.manual_seed(11)
     model = factory()

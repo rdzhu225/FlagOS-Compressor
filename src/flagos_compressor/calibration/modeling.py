@@ -36,6 +36,7 @@ def load_transformers_model(
     from flagos_compressor.calibration.moe import linearize_fused_experts
 
     linearize_fused_experts(model)
+    preserve_norm_activation_dtype(model)
     config = getattr(model, "config", None)
     text_config = getattr(config, "text_config", config)
     if text_config is not None and hasattr(text_config, "use_cache"):
@@ -43,6 +44,27 @@ def load_transformers_model(
     if config is not None and hasattr(config, "use_cache"):
         config.use_cache = False
     return model, tokenizer
+
+
+def _norm_output_in_input_dtype(_module, args, output):
+    return output.to(args[0].dtype)
+
+
+def preserve_norm_activation_dtype(model: nn.Module) -> None:
+    """Keep DeepSeek V4's FP32 norm weights without promoting A16 outputs.
+
+    Transformers keeps these weights in FP32 on loading, but its eager RMSNorm
+    multiplies after casting the normalized input to A16. That multiplication
+    promotes the output back to FP32 and the next BF16 Linear rejects it.
+    Cast the final norm output while retaining both FP32 parameters and the
+    model's normalization implementation. Hooks also retain autograd support.
+    """
+    for module in model.modules():
+        if (module.__class__.__name__ == 'DeepseekV4RMSNorm'
+                and module.__class__.__module__.startswith('transformers.models.deepseek_v4.')
+                and not getattr(module, '_flagos_norm_dtype_hook', False)):
+            module.register_forward_hook(_norm_output_in_input_dtype)
+            module._flagos_norm_dtype_hook = True
 
 
 def decoder_layers(model: nn.Module) -> list[tuple[str, nn.Module]]:
