@@ -540,13 +540,16 @@ def quantize_layer_autoround(
             best_loss = final_loss
             best_parameters = _snapshot_autoround_parameters(wrappers)
 
+        if hasattr(coverage, 'optimization_input_rows'):
+            coverage.optimization_input_rows = {
+                name: wrapper.num_optimization_rows for name, wrapper in wrappers.items()}
         _require_routed_expert_coverage(
             layer,
             set(linears),
             {
                 name
                 for name, wrapper in wrappers.items()
-                if wrapper.num_forwards > 0
+                if wrapper.num_optimization_rows > 0
             },
             "AutoRound",
             fused_names=fused_expert_linears,

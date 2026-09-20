@@ -55,6 +55,12 @@ def test_report_counts_routed_tokens_without_optimizer_repetitions(tmp_path, met
         assert rows[f'mlp.experts.1.{projection}'] == 4
     assert rows['mlp.shared_experts.gate_proj'] == 6
     assert report['layers'][0]['unobserved_modules'] == []
+    if method == 'autoround':
+        training = report['layers'][0]['optimization_input_rows']
+        assert training['mlp.experts.0.gate_proj'] == 2 * 3
+        assert training['mlp.experts.1.gate_proj'] == 4 * 3
+        assert training['mlp.shared_experts.gate_proj'] == 6 * 3
+        assert report['layers'][0]['optimization_unobserved_modules'] == []
 
 
 @pytest.mark.parametrize('method', ['gptq', 'awq', 'autoround'])

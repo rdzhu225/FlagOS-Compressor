@@ -5,6 +5,11 @@ from pathlib import Path
 import time
 
 
+class CalibrationCoverage(dict):
+    """Reference rows plus separately measured AutoRound optimizer rows."""
+    optimization_input_rows = None
+
+
 class CalibrationReport:
     def __init__(self, path, policy, sample_blocks):
         self.path = Path(path)
@@ -28,7 +33,7 @@ class CalibrationReport:
 
     @contextmanager
     def layer(self, name, module_names):
-        rows = {name: 0 for name in module_names}
+        rows = CalibrationCoverage({name: 0 for name in module_names})
         record = {"name": name, "state": "running", "input_rows": rows}
         self.data["layers"].append(record)
         self.save()
@@ -43,6 +48,10 @@ class CalibrationReport:
         finally:
             record["elapsed_seconds"] = time.monotonic() - started
             record["unobserved_modules"] = sorted(name for name, count in rows.items() if count == 0)
+            if rows.optimization_input_rows is not None:
+                record["optimization_input_rows"] = rows.optimization_input_rows
+                record["optimization_unobserved_modules"] = sorted(
+                    name for name, count in rows.optimization_input_rows.items() if count == 0)
             self.save()
 
     def complete(self, quantized_modules):
