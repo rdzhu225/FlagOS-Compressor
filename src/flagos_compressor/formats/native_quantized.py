@@ -79,6 +79,7 @@ def _patch_config(
     autoround_config: dict[str, Any] | None,
     quantized_modules: list[str],
     unquantized_modules: list[str],
+    fallbacks: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     config_path = output_path / "config.json"
     if not config_path.exists():
@@ -149,6 +150,11 @@ def _patch_config(
             "quant_method": "awq",
             "modules_to_not_convert": unquantized_modules,
         }
+    if fallbacks:
+        quantization_config.update(
+            algorithm=method+"+rtn", calibration_method=method,
+            fallback_quantization={"method":"rtn", "module_count":len(fallbacks), "modules":fallbacks},
+        )
     config["quantization_config"] = quantization_config
     config_path.write_text(
         json.dumps(config, indent=2, ensure_ascii=False) + "\n",
@@ -180,9 +186,14 @@ def save_native_quantized_model(
         raise RuntimeError(f"{method.upper()} selectors did not match any Linear modules")
     if method not in {"gptq", "awq", "autoround"}:
         raise ValueError(f"Unsupported native quantization method: {method}")
-    mismatched = sorted(
-        name for name, result in quantized.items() if result.algorithm != method
-    )
+    fallbacks = {
+        name: {"requested_method":method, "reason":result.fallback_reason}
+        for name, result in quantized.items()
+        if result.algorithm == "rtn" and result.fallback_from == method
+        and result.fallback_reason in {"no_calibration_input", "no_optimization_input"}
+    }
+    mismatched = sorted(name for name, result in quantized.items()
+                        if result.algorithm != method and name not in fallbacks)
     if mismatched:
         raise ValueError(
             f"Native {method.upper()} export received tensors from another method: "
@@ -287,6 +298,7 @@ def save_native_quantized_model(
         autoround_config=autoround_config,
         quantized_modules=quantized_modules,
         unquantized_modules=unquantized_modules,
+        fallbacks=fallbacks,
     )
     external_config_name = (
         "quantize_config.json"

@@ -400,6 +400,7 @@ def _build_calibration_policy(
             "split",
             "text_column",
             "trust_remote_code",
+            "unobserved_policy",
         },
     )
 
@@ -434,6 +435,7 @@ def _build_calibration_policy(
         seed=int(value("calibration_seed", "seed", 42)),
         split=str(value("calibration_split", "split", "train")),
         text_column=str(value("calibration_text_column", "text_column", "text")),
+        unobserved_policy=str(value("calibration_unobserved_policy", "unobserved_policy", "error")),
         trust_remote_code=bool(
             value("trust_remote_code", "trust_remote_code", False)
         ),

@@ -7,7 +7,10 @@ import time
 
 class CalibrationCoverage(dict):
     """Reference rows plus separately measured AutoRound optimizer rows."""
-    optimization_input_rows = None
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.optimization_input_rows = None
+        self.fallbacks = {}
 
 
 class CalibrationReport:
@@ -18,6 +21,7 @@ class CalibrationReport:
             "method": policy.method, "weight_bits": policy.num_bits,
             "group_size": policy.group_size, "seed": policy.calibration.seed,
             "sample_blocks": sample_blocks, "state": "running", "layers": [],
+            "unobserved_policy": policy.calibration.unobserved_policy,
             "coverage_unit": "input rows per selected projection",
             "coverage_scope": (
                 "one full FP reference pass before optimization"
@@ -48,6 +52,7 @@ class CalibrationReport:
         finally:
             record["elapsed_seconds"] = time.monotonic() - started
             record["unobserved_modules"] = sorted(name for name, count in rows.items() if count == 0)
+            record["fallbacks"] = rows.fallbacks
             if rows.optimization_input_rows is not None:
                 record["optimization_input_rows"] = rows.optimization_input_rows
                 record["optimization_unobserved_modules"] = sorted(
@@ -55,5 +60,8 @@ class CalibrationReport:
             self.save()
 
     def complete(self, quantized_modules):
-        self.data.update(state="completed", quantized_modules=quantized_modules)
+        fallbacks = sum(len(layer.get("fallbacks", {})) for layer in self.data["layers"])
+        self.data.update(state="completed", quantized_modules=quantized_modules,
+                         calibrated_modules=quantized_modules-fallbacks, fallback_modules=fallbacks,
+                         effective_method=self.data["method"]+("+rtn" if fallbacks else ""))
         self.save()

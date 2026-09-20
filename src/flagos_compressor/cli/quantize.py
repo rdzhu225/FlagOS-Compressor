@@ -99,9 +99,10 @@ def _run_calibrated(args, policy) -> None:
             autoround_config=autoround_config,
         )
     logger.info(
-        "Done. %s-quantized Linear modules: %d",
+        "Done. Requested %s; calibrated Linear modules: %d; explicit RTN fallback modules: %d",
         policy.method.upper(),
-        len(quantized),
+        sum(result.algorithm == policy.method for result in quantized.values()),
+        sum(result.algorithm == "rtn" for result in quantized.values()),
     )
     logger.info("Checkpoint format: %s", policy.format)
 

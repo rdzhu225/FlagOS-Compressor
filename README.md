@@ -271,6 +271,16 @@ hooks handle dense and routed-MoE models. Routed experts must be selected as a
 complete gate/up/down set. Source FP4/FP8 checkpoints are staged as BF16 before
 calibration.
 
+Calibration fails by default when a selected routed expert has no observations.
+To explicitly quantize those projections with weight-only round-to-nearest,
+pass `--calibration-unobserved-policy rtn` (recipe: `calibration.unobserved_policy: rtn`).
+Observed experts retain the requested calibration algorithm; AutoRound also
+checks actual optimizer inputs separately from its full reference pass.
+Zero coverage stays visible in `calibration_report.json`. Exported metadata
+identifies `gptq+rtn`, `awq+rtn`, or `autoround+rtn` and lists the fallback modules
+and reasons while preserving the corresponding GPTQ/AWQ tensor packing.
+This is an explicit mixed-algorithm experiment, not full expert calibration.
+
 Calibration data can use any of these formats (`text` below can be changed with
 `--calibration-text-column`):
 

@@ -27,8 +27,11 @@ class CalibrationPolicy:
     split: str = "train"
     text_column: str = "text"
     trust_remote_code: bool = False
+    unobserved_policy: str = "error"
 
     def __post_init__(self) -> None:
+        if self.unobserved_policy not in {"error", "rtn"}:
+            raise ValueError("calibration.unobserved_policy must be error or rtn")
         if self.samples <= 0 or self.sequence_length <= 0:
             raise ValueError("calibration samples and sequence_length must be positive")
         if not self.split or not self.text_column:

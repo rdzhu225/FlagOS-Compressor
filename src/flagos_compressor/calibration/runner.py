@@ -56,6 +56,8 @@ class NativeQuantizedLayer:
     algorithm: str
     packed: AutoGPTQPacked | AutoAWQPacked
     packing: str | None = None
+    fallback_from: str | None = None
+    fallback_reason: str | None = None
 
     def __post_init__(self) -> None:
         if self.packing is None:
@@ -116,16 +118,46 @@ def _require_routed_expert_coverage(
     method: str,
     *,
     fused_names: set[str] | None = None,
-) -> None:
+    unobserved_policy: str = "error",
+) -> set[str]:
     required = (fused_names or _fused_expert_linear_names(layer)) & selected
     missing = sorted(required - observed)
-    if missing:
+    if missing and unobserved_policy == "error":
         raise RuntimeError(
             f"{method} calibration did not route any tokens to "
             f"{len(missing)} selected expert projections. Increase calibration "
             "samples or use more representative data. First missing modules: "
             f"{missing[:3]}"
         )
+    if missing:
+        logger.warning("%s: %d unobserved expert projections will use explicit RTN fallback: %s",
+                       method, len(missing), missing[:3])
+    return set(missing)
+
+
+@torch.no_grad()
+def _rtn_fallback(linear, policy, name, coverage, *, reason):
+    """Keep the requested packing ABI while exposing the actual RTN algorithm."""
+    if policy.calibration.unobserved_policy != "rtn":
+        raise RuntimeError("RTN fallback must be explicitly enabled")
+    from flagos_compressor.quantizers.rtn import quantize_rtn
+    if policy.method == "awq":
+        result = pseudo_quantize_awq(linear.weight, bits=policy.num_bits,
+                    group_size=int(policy.group_size), zero_point=policy.awq.zero_point)
+        packed = pack_autoawq_gemm(result.weight, result.scales, result.zeros,
+                    group_size=int(policy.group_size), scale_dtype=torch.float16)
+        packing = "awq"
+    else:
+        result = quantize_rtn(linear.weight, bits=policy.num_bits, group_size=int(policy.group_size),
+                    symmetric=policy.gptq.symmetric if policy.method == "gptq" else True)
+        packed = pack_autogptq(result.weight.cpu(), result.scales.cpu(), result.zeros.cpu(),
+                    result.g_idx.cpu(), bits=policy.num_bits, scale_dtype=linear.weight.dtype)
+        packing = "gptq"
+    linear.weight.copy_(result.weight)
+    if hasattr(coverage, "fallbacks"):
+        coverage.fallbacks[name] = {"method":"rtn", "requested_method":policy.method, "reason":reason}
+    return NativeQuantizedLayer("rtn", packed, packing=packing,
+                                fallback_from=policy.method, fallback_reason=reason)
 
 
 def _validate_native_shapes(
@@ -279,7 +311,7 @@ def quantize_layer_gptq(
         finally:
             for handle in handles:
                 handle.remove()
-        _require_routed_expert_coverage(
+        missing = _require_routed_expert_coverage(
             layer,
             set(group),
             {
@@ -288,9 +320,14 @@ def quantize_layer_gptq(
                 if quantizer.num_samples > 0
             },
             "GPTQ",
+            unobserved_policy=policy.calibration.unobserved_policy,
         )
         for name in group:
             linear = linears[name]
+            if name in missing:
+                results[f"{layer_name}.{name}"] = _rtn_fallback(
+                    linear, policy, name, coverage, reason="no_calibration_input")
+                continue
             result = quantizers[name].quantize(
                 block_size=policy.gptq.block_size,
                 damp_percent=policy.gptq.damp_percent,
@@ -543,7 +580,7 @@ def quantize_layer_autoround(
         if hasattr(coverage, 'optimization_input_rows'):
             coverage.optimization_input_rows = {
                 name: wrapper.num_optimization_rows for name, wrapper in wrappers.items()}
-        _require_routed_expert_coverage(
+        missing = _require_routed_expert_coverage(
             layer,
             set(linears),
             {
@@ -553,11 +590,16 @@ def quantize_layer_autoround(
             },
             "AutoRound",
             fused_names=fused_expert_linears,
+            unobserved_policy=policy.calibration.unobserved_policy,
         )
 
         results: dict[str, NativeQuantizedLayer] = {}
         with torch.no_grad():
             for name, wrapper in wrappers.items():
+                if name in missing:
+                    results[f"{layer_name}.{name}"] = _rtn_fallback(
+                        linears[name], policy, name, coverage, reason="no_optimization_input")
+                    continue
                 best_value, best_minimum, best_maximum = best_parameters[name]
                 wrapper.value.copy_(best_value.to(device))
                 wrapper.min_scale.copy_(best_minimum.to(device))
@@ -640,15 +682,18 @@ def quantize_layer_awq(
     finally:
         for handle in handles:
             handle.remove()
-    inputs = {name: torch.cat(values, dim=0) for name, values in features.items() if values}
+    inputs = {name: torch.cat(nonempty, dim=0)
+              for name, values in features.items()
+              if (nonempty := [value for value in values if value.numel()])}
     for name in linears:
         if name in inputs:
             _observe_rows(coverage, name, inputs[name])
-    _require_routed_expert_coverage(
+    missing = _require_routed_expert_coverage(
         layer,
         set(linears),
         set(inputs),
         "AWQ",
+        unobserved_policy=policy.calibration.unobserved_policy,
     )
 
     for mapping in mappings:
@@ -692,6 +737,10 @@ def quantize_layer_awq(
 
     results: dict[str, NativeQuantizedLayer] = {}
     for name, linear in linears.items():
+        if name in missing:
+            results[f"{layer_name}.{name}"] = _rtn_fallback(
+                linear, policy, name, coverage, reason="no_calibration_input")
+            continue
         quantized = pseudo_quantize_awq(
             linear.weight,
             bits=4,
