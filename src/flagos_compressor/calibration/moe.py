@@ -8,6 +8,8 @@ router and decoder implementations remain the original Transformers modeling.
 from __future__ import annotations
 
 from collections.abc import Callable
+import copy
+import types
 
 import torch
 from torch import nn
@@ -16,6 +18,26 @@ from torch import nn
 def _default_apply_gate(value: torch.Tensor) -> torch.Tensor:
     gate, up = value.chunk(2, dim=-1)
     return torch.nn.functional.silu(gate) * up
+
+
+def _gate_without_expert_weights(original: nn.Module):
+    """Retain a gate's configuration without retaining its fused weight banks.
+
+    A bound _apply_gate otherwise owns the entire old experts module. Moving
+    the new 2D linears to CUDA then leaves a second, unused BF16 copy on CPU.
+    Rebind the original method to a shallow context with only those redundant
+    parameters removed; activation modules and scalar settings stay identical.
+    """
+    gate = getattr(original, "_apply_gate", None)
+    if isinstance(gate, types.MethodType) and gate.__self__ is original:
+        context = copy.copy(original)
+        context._parameters = {
+            name: parameter for name, parameter in original._parameters.items()
+            if name not in {"gate_up_proj", "up_proj", "down_proj",
+                            "gate_up_proj_bias", "up_proj_bias", "down_proj_bias"}
+        }
+        gate = types.MethodType(gate.__func__, context)
+    return gate
 
 
 def _linear(weight: torch.Tensor, bias: torch.Tensor | None = None) -> nn.Linear:
@@ -89,7 +111,7 @@ class LinearExperts2D(nn.ModuleList):
             hidden_dim = int(down.shape[1])
         non_transposed = down.shape[1] == hidden_dim
         intermediate = int(down.shape[2] if non_transposed else down.shape[1])
-        apply_gate = getattr(original, "_apply_gate", None)
+        apply_gate = _gate_without_expert_weights(original)
         activation = getattr(original, "act_fn", nn.Identity())
 
         experts: list[nn.Module] = []
