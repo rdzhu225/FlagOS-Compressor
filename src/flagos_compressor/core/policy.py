@@ -70,6 +70,7 @@ class AWQPolicy:
     apply_clip: bool = True
     n_grid: int = 20
     max_chunk_memory: int = 1024 * 1024 * 1024
+    forward_batch_size: int | None = None
 
     def __post_init__(self) -> None:
         normalized = self.version.lower()
@@ -78,6 +79,8 @@ class AWQPolicy:
             raise ValueError("Only AutoAWQ GEMM checkpoint format is currently supported")
         if self.n_grid <= 0 or self.max_chunk_memory <= 0:
             raise ValueError("awq.n_grid and max_chunk_memory must be positive")
+        if self.forward_batch_size is not None and self.forward_batch_size <= 0:
+            raise ValueError("awq.forward_batch_size must be positive")
 
 
 @dataclass(frozen=True)

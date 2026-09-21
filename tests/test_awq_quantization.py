@@ -1,4 +1,5 @@
 import torch
+import pytest
 from torch import nn
 
 from flagos_compressor.packing.autoawq import pack_autoawq_gemm
@@ -100,3 +101,67 @@ def test_awq_scale_preserves_zero_centered_qwen_rmsnorm_linear_pair():
     apply_awq_scale(norm, [linear], torch.tensor([0.5, 2.0, 0.25, 4.0]))
 
     torch.testing.assert_close(linear(norm(inputs)), expected)
+
+
+def test_awq_chunked_forward_keeps_global_search_and_batched_kwargs():
+    class BatchedBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(8, 16, bias=False)
+            self.batch_limit = 5
+            self.observed = []
+
+        def forward(self, x, *, position_embeddings, attention_mask, input_ids,
+                    cache_position, past_key_values):
+            batch, seq, _ = x.shape
+            assert batch <= self.batch_limit
+            assert attention_mask.shape == (batch, 1, seq, seq)
+            assert input_ids.shape == (batch, seq)
+            assert all(value.shape == (batch, seq, 16) for value in position_embeddings)
+            assert cache_position.shape == (seq,)
+            assert not past_key_values['used']
+            past_key_values['used'] = True
+            self.observed.append(batch)
+            return self.proj(x).tanh() + position_embeddings[0] * input_ids[..., None]
+
+    torch.manual_seed(26)
+    block = BatchedBlock()
+    inputs = torch.randn(5, 3, 8)
+    inputs[-1].mul_(20)  # Uneven final batch must receive its true sample weight.
+    kwargs = {'position_embeddings': (torch.randn(5, 3, 16), torch.randn(5, 3, 16)),
+              'attention_mask': torch.ones(5, 1, 3, 3), 'input_ids': torch.arange(15).reshape(5, 3),
+              'cache_position': torch.arange(3), 'past_key_values': {'used': False}}
+    original = block.proj.weight.detach().clone()
+    whole = search_awq_scale(block, [block.proj], inputs, kwargs=kwargs, group_size=4, n_grid=20)
+    block.batch_limit = 2
+    block.observed.clear()
+    chunked = search_awq_scale(block, [block.proj], inputs, kwargs=kwargs,
+                               group_size=4, n_grid=20, forward_batch_size=2)
+    torch.testing.assert_close(chunked, whole)
+    torch.testing.assert_close(block.proj.weight, original, rtol=0, atol=0)
+    assert block.observed == [2, 2, 1] * 21
+    assert kwargs['past_key_values'] == {'used': False}
+
+
+def test_awq_forward_limit_does_not_split_flat_expert_rows():
+    torch.manual_seed(2)
+    linear = nn.Linear(8, 8, bias=False)
+    sizes = []
+    handle = linear.register_forward_pre_hook(lambda _m, args: sizes.append(args[0].shape[0]))
+    try:
+        search_awq_scale(linear, [linear], torch.randn(17, 8), group_size=4,
+                         n_grid=4, forward_batch_size=2)
+    finally:
+        handle.remove()
+    assert sizes == [17] * 5
+
+
+def test_awq_forward_limit_cli_and_policy_validation():
+    from flagos_compressor.cli.main import build_parser
+    from flagos_compressor.cli.helpers import build_quantization_policy
+    from flagos_compressor.core.policy import AWQPolicy
+    args = build_parser().parse_args(['quantize', '--input', 'unused', '--output', 'unused-out',
+                                     '--method', 'awq', '--select', 'attention', '--awq-forward-batch-size', '4'])
+    assert build_quantization_policy(args).awq.forward_batch_size == 4
+    with pytest.raises(ValueError, match='forward_batch_size'):
+        AWQPolicy(forward_batch_size=0)

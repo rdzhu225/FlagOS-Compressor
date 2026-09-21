@@ -491,6 +491,7 @@ def _build_awq_policy(args, recipe: dict) -> AWQPolicy:
             "apply_clip",
             "n_grid",
             "max_chunk_memory",
+            "forward_batch_size",
         },
     )
 
@@ -507,6 +508,8 @@ def _build_awq_policy(args, recipe: dict) -> AWQPolicy:
         max_chunk_memory=int(
             value("awq_max_chunk_memory", "max_chunk_memory", 1024 * 1024 * 1024)
         ),
+        forward_batch_size=(int(value("awq_forward_batch_size", "forward_batch_size", None))
+                            if value("awq_forward_batch_size", "forward_batch_size", None) is not None else None),
     )
 
 

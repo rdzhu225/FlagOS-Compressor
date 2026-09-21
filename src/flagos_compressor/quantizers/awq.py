@@ -102,6 +102,7 @@ def search_awq_scale(
     duo_scaling: bool = True,
     n_grid: int = 20,
     max_chunk_memory: int = 1024 * 1024 * 1024,
+    forward_batch_size: int | None = None,
 ) -> torch.Tensor:
     """Run AutoAWQ's output-MSE grid search for one scaling relationship."""
     linears = list(linears)
@@ -110,23 +111,50 @@ def search_awq_scale(
     kwargs = dict(kwargs or {})
     kwargs.pop("use_cache", None)
     device = next(module.parameters()).device
-    inputs = inputs.to(device)
+    if forward_batch_size is not None and forward_batch_size <= 0:
+        raise ValueError("forward_batch_size must be positive")
+    # A 2D expert input is a flat token matrix, not a batch of sequences.
+    # Splitting it by a small sequence-batch limit would create thousands of
+    # tiny GEMMs. Only split the batch axis of sequence-shaped inputs.
+    batch_step = (forward_batch_size if inputs.ndim >= 3 and forward_batch_size
+                  else inputs.shape[0])
+    ranges = [(start, min(start + batch_step, inputs.shape[0]))
+              for start in range(0, inputs.shape[0], batch_step)]
 
     weight = torch.cat([linear.weight for linear in linears], dim=0)
     original_shape = weight.shape
     normalized = weight.view(-1, group_size)
     normalized = normalized.abs() / (normalized.abs().amax(dim=1, keepdim=True) + 1e-6)
     weight_mean = normalized.view(original_shape).mean(dim=0).float()
-    input_mean = inputs.detach().abs().reshape(-1, inputs.shape[-1]).float().mean(dim=0)
+    del weight, normalized
+    input_sum = torch.zeros(inputs.shape[-1], device=device, dtype=torch.float32)
+    for start, stop in ranges:
+        values = inputs[start:stop].detach().to(device).reshape(-1, inputs.shape[-1])
+        input_sum.add_(values.abs().float().sum(dim=0))
+    del values
+    input_mean = input_sum / (inputs.numel() // inputs.shape[-1])
 
-    def replay():
-        call_kwargs = dict(kwargs)
+    def slice_kwargs(value, start, stop):
+        if isinstance(value, torch.Tensor):
+            if value.ndim > 1 and value.shape[0] == inputs.shape[0]:
+                value = value[start:stop]
+            return value.to(device)
+        if isinstance(value, dict):
+            return {key: slice_kwargs(item, start, stop) for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return type(value)(slice_kwargs(item, start, stop) for item in value)
+        return value
+
+    def replay(start, stop):
+        call_kwargs = slice_kwargs(kwargs, start, stop)
         for name in ("past_key_values", "past_key_value"):
             if call_kwargs.get(name) is not None:
                 call_kwargs[name] = copy.deepcopy(call_kwargs[name])
-        return _first_tensor(module(inputs, **call_kwargs))
+        return _first_tensor(module(inputs[start:stop].to(device), **call_kwargs))
 
-    reference = replay().detach()
+    # Retain references in host memory; each candidate is compared on-device
+    # one batch at a time. The global loss weights uneven batches by elements.
+    references = [replay(start, stop).detach().cpu() for start, stop in ranges]
     original_weights = [linear.weight.detach().clone() for linear in linears]
     best_error = float("inf")
     best_scales: torch.Tensor | None = None
@@ -155,8 +183,14 @@ def search_awq_scale(
                     ).weight
                     / scale_view
                 )
-            candidate = replay()
-            error = _mse_chunked(reference, candidate, max_chunk_memory)
+            error_sum = 0.0
+            elements = 0
+            for (start, stop), reference in zip(ranges, references):
+                candidate = replay(start, stop)
+                error_sum += _mse_chunked(reference.to(device), candidate, max_chunk_memory) * reference.numel()
+                elements += reference.numel()
+                del candidate
+            error = error_sum / elements
             if error < best_error:
                 best_error = error
                 best_scales = scales.detach().clone()

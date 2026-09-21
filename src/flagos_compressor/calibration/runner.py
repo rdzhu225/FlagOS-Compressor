@@ -716,6 +716,7 @@ def quantize_layer_awq(
             duo_scaling=policy.awq.duo_scaling,
             n_grid=policy.awq.n_grid,
             max_chunk_memory=policy.awq.max_chunk_memory,
+            forward_batch_size=policy.awq.forward_batch_size,
         )
         apply_awq_scale(previous, balance, scales)
         for name in mapping.linear_names:

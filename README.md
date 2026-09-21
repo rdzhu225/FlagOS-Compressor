@@ -218,6 +218,12 @@ asymmetric zero points, and native GEMM packing order. The result has
 `qweight/qzeros/scales` tensors and an AWQ quantization config. Native AWQ is
 currently W4A16 GEMM with zero points.
 
+AWQ scale search can bound sequence batches with `--awq-forward-batch-size 4`
+(recipe: `awq.forward_batch_size: 4`). This preserves all calibration samples
+and selects scales using the global, element-weighted error, while storing
+reference outputs on CPU. It limits forward batch size, separately from
+`--awq-max-chunk-memory`, which bounds chunks used to calculate output error.
+
 ### AutoRound (native PyTorch)
 
 ```bash

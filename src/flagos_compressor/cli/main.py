@@ -151,6 +151,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     quantize.add_argument("--awq-n-grid", type=int)
     quantize.add_argument("--awq-max-chunk-memory", type=int)
+    quantize.add_argument("--awq-forward-batch-size", type=int,
+                         help="Maximum sequence batch per AWQ scale-search forward; all calibration samples remain included.")
     quantize.add_argument("--autoround-iters", type=int)
     quantize.add_argument(
         "--autoround-config",
