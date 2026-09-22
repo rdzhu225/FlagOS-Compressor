@@ -16,6 +16,7 @@ class CalibrationCoverage(dict):
 class CalibrationReport:
     def __init__(self, path, policy, sample_blocks):
         self.path = Path(path)
+        self.policy = policy
         self.data = {
             "schema": "flagos-compressor.calibration.v1",
             "method": policy.method, "weight_bits": policy.num_bits,
@@ -28,6 +29,10 @@ class CalibrationReport:
                 if policy.method == "autoround" else "statistics collection pass"
             ),
         }
+        if policy.target_scheme_rules:
+            from dataclasses import asdict
+            self.data.update(weight_bits="per_module", group_size="per_module",
+                             target_scheme_rules=[asdict(rule) for rule in policy.target_scheme_rules])
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -39,6 +44,16 @@ class CalibrationReport:
     def layer(self, name, module_names):
         rows = CalibrationCoverage({name: 0 for name in module_names})
         record = {"name": name, "state": "running", "input_rows": rows}
+        if self.policy.target_scheme_rules:
+            from flagos_compressor.inspect.tensor_classifier import classify_weight
+            record["module_quantization"] = {}
+            for module_name in module_names:
+                weight_name = f"{name}.{module_name}.weight"
+                _, tags = classify_weight(weight_name)
+                settings = self.policy.settings_for_name(weight_name, tags)
+                record["module_quantization"][module_name] = {
+                    "bits": settings.num_bits, "group_size": settings.group_size,
+                }
         self.data["layers"].append(record)
         self.save()
         started = time.monotonic()

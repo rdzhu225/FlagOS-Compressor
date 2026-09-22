@@ -58,6 +58,8 @@ class NativeQuantizedLayer:
     packing: str | None = None
     fallback_from: str | None = None
     fallback_reason: str | None = None
+    num_bits: int | None = None
+    group_size: int | None = None
 
     def __post_init__(self) -> None:
         if self.packing is None:
@@ -157,7 +159,8 @@ def _rtn_fallback(linear, policy, name, coverage, *, reason):
     if hasattr(coverage, "fallbacks"):
         coverage.fallbacks[name] = {"method":"rtn", "requested_method":policy.method, "reason":reason}
     return NativeQuantizedLayer("rtn", packed, packing=packing,
-                                fallback_from=policy.method, fallback_reason=reason)
+                                fallback_from=policy.method, fallback_reason=reason,
+                                num_bits=policy.num_bits, group_size=policy.group_size)
 
 
 def _validate_native_shapes(
@@ -281,7 +284,15 @@ def quantize_layer_gptq(
     linears = selected_linears(layer_name, layer, policy)
     if not linears:
         return {}
-    _validate_native_shapes(linears, policy)
+    settings = {}
+    for name, linear in linears.items():
+        weight_name = f"{layer_name}.{name}.weight"
+        _, tags = classify_weight(weight_name)
+        settings[name] = policy.settings_for_name(weight_name, tags)
+        _validate_native_shapes({name: linear}, settings[name])
+    if policy.target_scheme_rules:
+        from flagos_compressor.calibration.plan import validate_layer_schemes
+        validate_layer_schemes(layer_name, layer, settings)
     _validate_fused_moe_selection(layer_name, layer, set(linears))
     groups = (
         gptq_sequential_groups(list(linears))
@@ -294,7 +305,7 @@ def quantize_layer_gptq(
         quantizers = {
             name: GPTQQuantizer(
                 linears[name].weight,
-                bits=policy.num_bits,
+                bits=settings[name].num_bits,
                 symmetric=policy.gptq.symmetric,
             )
             for name in group
@@ -326,12 +337,12 @@ def quantize_layer_gptq(
             linear = linears[name]
             if name in missing:
                 results[f"{layer_name}.{name}"] = _rtn_fallback(
-                    linear, policy, name, coverage, reason="no_calibration_input")
+                    linear, settings[name], name, coverage, reason="no_calibration_input")
                 continue
             result = quantizers[name].quantize(
                 block_size=policy.gptq.block_size,
                 damp_percent=policy.gptq.damp_percent,
-                group_size=int(policy.group_size or -1),
+                group_size=int(settings[name].group_size or -1),
                 desc_act=policy.gptq.desc_act,
                 static_groups=policy.gptq.static_groups,
             )
@@ -341,10 +352,12 @@ def quantize_layer_gptq(
                 result.scales,
                 result.zeros,
                 result.g_idx,
-                bits=policy.num_bits,
+                bits=settings[name].num_bits,
                 scale_dtype=linear.weight.dtype,
             )
-            results[f"{layer_name}.{name}"] = NativeQuantizedLayer("gptq", packed)
+            results[f"{layer_name}.{name}"] = NativeQuantizedLayer(
+                "gptq", packed, num_bits=settings[name].num_bits,
+                group_size=settings[name].group_size)
     return results
 
 

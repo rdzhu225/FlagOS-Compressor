@@ -80,13 +80,41 @@ every requested scheme. A W4A16/W8A8 combination uses the official
 aliases are included. Source-quantized weights that match no rule follow the
 existing `unselected` policy and are converted to BF16 by default.
 
-Per-selector mode currently supports MSE W4A16, W8A16, and W8A8. The local
+Per-selector mode supports MSE W4A16, W8A16, and W8A8, plus groupwise GPTQ
+W4A16/W8A16. The local
 selectors own `weight_format`, `activation_bits`, `scale_dtype`, `strategy`,
 `group_size`, and `chunk_size`, so do not combine them with those global
 settings.
 `--n-candidates`, exclusions, the unselected policy, and backend/device flags
 remain configurable. Use `--dry-run` to inspect the resolved plan without
 writing the output checkpoint.
+
+### Calibrated GPTQ mixed bit widths
+
+```bash
+flagos-compressor quantize --input /path/to/model --output /path/to/gptq-mixed \
+  --method gptq \
+  --select attention=int8 activation-bits=16 strategy=group group-size=128 \
+  --select moe=int4 activation-bits=16 strategy=group group-size=128 \
+  --calibration-data /path/to/calibration.jsonl \
+  --calibration-samples 256 --calibration-seq-length 2048 \
+  --no-desc-act --backend cuda --device cuda:0
+```
+
+To keep shared experts at W8A16, append
+`--select moe.shared=int8 activation-bits=16 strategy=group group-size=128`.
+Later rules override earlier rules. Fused attention pairs and routed expert
+banks must have a consistent bit width and group size; shared experts are
+separate units. Invalid combinations fail before collecting activations.
+
+This path uses GPTQ calibration and native GPTQ `qweight/qzeros/scales/g_idx`
+packing. It writes a `calibration_plan.json`, per-module calibration records,
+and standard GPTQ `dynamic` overrides plus exact `flagos_module_quantization`
+metadata. W8 modules are actually calibrated and packed at 8 bits, including
+explicitly requested RTN fallbacks. DeepSeek-V4 native vLLM loading requires
+the companion vllm-plugin-FL module-scheme mapper for HF names and fused aliases.
+Custom non-Linear projections remain floating point and appear in the plan's
+retained-module list. AWQ and AutoRound per-selector calibration remain unsupported.
 
 ## Convert to BF16
 
