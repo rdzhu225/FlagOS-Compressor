@@ -17,6 +17,16 @@ from flagos_compressor.core.policy import (
 )
 
 
+def test_jsonl_preserves_unicode_line_separators(tmp_path):
+    import json
+    from flagos_compressor.calibration.data import _read_local_text
+
+    texts = ['before\u2028after', 'paragraph\u2029separator', 'next\u0085line']
+    path = tmp_path / 'samples.jsonl'
+    path.write_text(''.join(json.dumps({'text': text}, ensure_ascii=False) + '\n' for text in texts))
+    assert _read_local_text(path, 'text') == texts
+
+
 class _Tokenizer:
     def encode(self, text, **_kwargs):
         return [ord(character) % 31 + 1 for character in text]
@@ -48,6 +58,10 @@ def test_transformers_v5_fused_experts_linearize_exactly():
         num_experts=2,
     )
     original = Qwen3MoeExperts(config).eval()
+    # Standalone expert modules allocate empty parameters; only the enclosing
+    # PreTrainedModel normally initializes them. Avoid allocator-dependent NaNs.
+    for parameter in original.parameters():
+        torch.nn.init.normal_(parameter, std=0.1)
     hidden = torch.randn(5, 8)
     expert_indices = torch.tensor([[0], [1], [0], [1], [1]])
     routing_weights = torch.rand(5, 1)

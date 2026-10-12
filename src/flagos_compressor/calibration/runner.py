@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 import logging
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -16,6 +18,7 @@ from flagos_compressor.calibration.mappings import (
 from flagos_compressor.calibration.modeling import (
     forward_layer_samples,
     move_to_device,
+    prepare_forward_kwargs,
     sanitize_kwargs,
 )
 from flagos_compressor.core.policy import QuantizationPolicy
@@ -36,6 +39,16 @@ from flagos_compressor.quantizers.gptq import GPTQQuantizer
 logger = logging.getLogger(__name__)
 
 
+def _observe_rows(coverage: dict[str, int] | None, name: str, inputs: torch.Tensor) -> None:
+    if coverage is not None:
+        coverage[name] = coverage.get(name, 0) + inputs.numel() // inputs.shape[-1]
+
+
+def _observe_gptq_batch(quantizer, inputs, coverage, name):
+    _observe_rows(coverage, name, inputs)
+    quantizer.add_batch(inputs)
+
+
 @dataclass(frozen=True)
 class NativeQuantizedLayer:
     """A quantized layer with independent algorithm and checkpoint packing."""
@@ -43,6 +56,10 @@ class NativeQuantizedLayer:
     algorithm: str
     packed: AutoGPTQPacked | AutoAWQPacked
     packing: str | None = None
+    fallback_from: str | None = None
+    fallback_reason: str | None = None
+    num_bits: int | None = None
+    group_size: int | None = None
 
     def __post_init__(self) -> None:
         if self.packing is None:
@@ -103,16 +120,47 @@ def _require_routed_expert_coverage(
     method: str,
     *,
     fused_names: set[str] | None = None,
-) -> None:
+    unobserved_policy: str = "error",
+) -> set[str]:
     required = (fused_names or _fused_expert_linear_names(layer)) & selected
     missing = sorted(required - observed)
-    if missing:
+    if missing and unobserved_policy == "error":
         raise RuntimeError(
             f"{method} calibration did not route any tokens to "
             f"{len(missing)} selected expert projections. Increase calibration "
             "samples or use more representative data. First missing modules: "
             f"{missing[:3]}"
         )
+    if missing:
+        logger.warning("%s: %d unobserved expert projections will use explicit RTN fallback: %s",
+                       method, len(missing), missing[:3])
+    return set(missing)
+
+
+@torch.no_grad()
+def _rtn_fallback(linear, policy, name, coverage, *, reason):
+    """Keep the requested packing ABI while exposing the actual RTN algorithm."""
+    if policy.calibration.unobserved_policy != "rtn":
+        raise RuntimeError("RTN fallback must be explicitly enabled")
+    from flagos_compressor.quantizers.rtn import quantize_rtn
+    if policy.method == "awq":
+        result = pseudo_quantize_awq(linear.weight, bits=policy.num_bits,
+                    group_size=int(policy.group_size), zero_point=policy.awq.zero_point)
+        packed = pack_autoawq_gemm(result.weight, result.scales, result.zeros,
+                    group_size=int(policy.group_size), scale_dtype=torch.float16)
+        packing = "awq"
+    else:
+        result = quantize_rtn(linear.weight, bits=policy.num_bits, group_size=int(policy.group_size),
+                    symmetric=policy.gptq.symmetric if policy.method == "gptq" else True)
+        packed = pack_autogptq(result.weight.cpu(), result.scales.cpu(), result.zeros.cpu(),
+                    result.g_idx.cpu(), bits=policy.num_bits, scale_dtype=linear.weight.dtype)
+        packing = "gptq"
+    linear.weight.copy_(result.weight)
+    if hasattr(coverage, "fallbacks"):
+        coverage.fallbacks[name] = {"method":"rtn", "requested_method":policy.method, "reason":reason}
+    return NativeQuantizedLayer("rtn", packed, packing=packing,
+                                fallback_from=policy.method, fallback_reason=reason,
+                                num_bits=policy.num_bits, group_size=policy.group_size)
 
 
 def _validate_native_shapes(
@@ -164,23 +212,44 @@ def _run_samples(
     layer.to(device)
     for args, kwargs in samples:
         moved_args = move_to_device(args, device)
-        moved_kwargs = move_to_device(sanitize_kwargs(layer, kwargs), device)
+        moved_kwargs = prepare_forward_kwargs(layer, kwargs, device)
         layer(*moved_args, **moved_kwargs)
 
 
 def _forward_kwargs_for_submodule(
     module: nn.Module,
-    sample_kwargs: dict[str, Any],
+    samples: list[tuple[tuple[Any, ...], dict[str, Any]]],
     device: torch.device,
 ) -> dict[str, Any]:
-    kwargs = sanitize_kwargs(module, sample_kwargs)
-    # AWQ evaluates a captured attention input repeatedly. Reusing a mutable KV
-    # cache would append the same tokens on every grid-search candidate and can
-    # also mix batch shapes across samples (notably on DeepSeek-V4).
-    for cache_name in ("past_key_values", "past_key_value"):
-        if cache_name in kwargs:
-            kwargs[cache_name] = None
-    return move_to_device(kwargs, device)
+    """Collate supported inputs alongside AWQ's concatenated feature batches."""
+    batch_sizes = [args[0].shape[0] for args, _kwargs in samples]
+
+    def merge(values):
+        first = values[0]
+        if isinstance(first, torch.Tensor):
+            if first.ndim > 1 and all(
+                isinstance(value, torch.Tensor)
+                and value.shape[0] == batch_size
+                and value.shape[1:] == first.shape[1:]
+                for value, batch_size in zip(values, batch_sizes)
+            ):
+                return torch.cat(values, dim=0)
+            if not all(torch.equal(first, value) for value in values):
+                raise ValueError("AWQ cannot batch unequal non-batched forward kwargs")
+            return first
+        if isinstance(first, dict):
+            return {key: merge([value[key] for value in values]) for key in first}
+        if isinstance(first, (tuple, list)):
+            return type(first)(merge([value[i] for value in values]) for i in range(len(first)))
+        return first
+
+    kwargs = {}
+    for key in sanitize_kwargs(module, samples[0][1]):
+        values = [sample_kwargs[key] for _args, sample_kwargs in samples]
+        # Capture occurs before the first decoder block, so these caches are
+        # empty. Each replay allocates its own batched cache lazily.
+        kwargs[key] = values[0] if key in {"past_key_values", "past_key_value"} else merge(values)
+    return prepare_forward_kwargs(module, kwargs, device)
 
 
 def _capture_awq_input(
@@ -210,11 +279,20 @@ def quantize_layer_gptq(
     policy: QuantizationPolicy,
     *,
     device: torch.device,
+    coverage: dict[str, int] | None = None,
 ) -> dict[str, NativeQuantizedLayer]:
     linears = selected_linears(layer_name, layer, policy)
     if not linears:
         return {}
-    _validate_native_shapes(linears, policy)
+    settings = {}
+    for name, linear in linears.items():
+        weight_name = f"{layer_name}.{name}.weight"
+        _, tags = classify_weight(weight_name)
+        settings[name] = policy.settings_for_name(weight_name, tags)
+        _validate_native_shapes({name: linear}, settings[name])
+    if policy.target_scheme_rules:
+        from flagos_compressor.calibration.plan import validate_layer_schemes
+        validate_layer_schemes(layer_name, layer, settings)
     _validate_fused_moe_selection(layer_name, layer, set(linears))
     groups = (
         gptq_sequential_groups(list(linears))
@@ -227,14 +305,15 @@ def quantize_layer_gptq(
         quantizers = {
             name: GPTQQuantizer(
                 linears[name].weight,
-                bits=policy.num_bits,
+                bits=settings[name].num_bits,
                 symmetric=policy.gptq.symmetric,
             )
             for name in group
         }
         handles = [
             linears[name].register_forward_pre_hook(
-                lambda _module, args, q=quantizers[name]: q.add_batch(args[0])
+                lambda _module, args, q=quantizers[name], name=name:
+                    _observe_gptq_batch(q, args[0], coverage, name)
             )
             for name in group
         ]
@@ -243,7 +322,7 @@ def quantize_layer_gptq(
         finally:
             for handle in handles:
                 handle.remove()
-        _require_routed_expert_coverage(
+        missing = _require_routed_expert_coverage(
             layer,
             set(group),
             {
@@ -252,13 +331,18 @@ def quantize_layer_gptq(
                 if quantizer.num_samples > 0
             },
             "GPTQ",
+            unobserved_policy=policy.calibration.unobserved_policy,
         )
         for name in group:
             linear = linears[name]
+            if name in missing:
+                results[f"{layer_name}.{name}"] = _rtn_fallback(
+                    linear, settings[name], name, coverage, reason="no_calibration_input")
+                continue
             result = quantizers[name].quantize(
                 block_size=policy.gptq.block_size,
                 damp_percent=policy.gptq.damp_percent,
-                group_size=int(policy.group_size or -1),
+                group_size=int(settings[name].group_size or -1),
                 desc_act=policy.gptq.desc_act,
                 static_groups=policy.gptq.static_groups,
             )
@@ -268,10 +352,12 @@ def quantize_layer_gptq(
                 result.scales,
                 result.zeros,
                 result.g_idx,
-                bits=policy.num_bits,
+                bits=settings[name].num_bits,
                 scale_dtype=linear.weight.dtype,
             )
-            results[f"{layer_name}.{name}"] = NativeQuantizedLayer("gptq", packed)
+            results[f"{layer_name}.{name}"] = NativeQuantizedLayer(
+                "gptq", packed, num_bits=settings[name].num_bits,
+                group_size=settings[name].group_size)
     return results
 
 
@@ -307,10 +393,7 @@ def _autoround_loss(
     for sample_index in indices:
         args, kwargs = input_samples[sample_index]
         moved_args = move_to_device(args, device)
-        moved_kwargs = move_to_device(
-            sanitize_kwargs(layer, kwargs),
-            device,
-        )
+        moved_kwargs = prepare_forward_kwargs(layer, kwargs, device)
         predicted = _hidden_output(layer(*moved_args, **moved_kwargs))
         target = fp_outputs[sample_index][0][0].to(
             device=device,
@@ -367,6 +450,7 @@ def quantize_layer_autoround(
     *,
     device: torch.device,
     layer_index: int = 0,
+    coverage: dict[str, int] | None = None,
 ) -> tuple[
     dict[str, NativeQuantizedLayer],
     list[tuple[tuple[Any, ...], dict[str, Any]]],
@@ -376,7 +460,19 @@ def quantize_layer_autoround(
     if not fp_samples:
         raise ValueError("AutoRound requires at least one calibration sample")
     linears = selected_linears(layer_name, layer, policy)
-    fp_outputs = forward_layer_samples(layer, fp_samples, device=device)
+    # Count the existing full reference pass rather than repeated optimizer
+    # minibatches, so coverage does not increase merely by raising iters.
+    handles = [
+        linear.register_forward_pre_hook(
+            lambda _module, args, name=name: _observe_rows(coverage, name, args[0])
+        )
+        for name, linear in linears.items()
+    ] if coverage is not None else []
+    try:
+        fp_outputs = forward_layer_samples(layer, fp_samples, device=device)
+    finally:
+        for handle in handles:
+            handle.remove()
     input_samples = (
         quantized_samples
         if policy.autoround.enable_quantized_input
@@ -494,21 +590,29 @@ def quantize_layer_autoround(
             best_loss = final_loss
             best_parameters = _snapshot_autoround_parameters(wrappers)
 
-        _require_routed_expert_coverage(
+        if hasattr(coverage, 'optimization_input_rows'):
+            coverage.optimization_input_rows = {
+                name: wrapper.num_optimization_rows for name, wrapper in wrappers.items()}
+        missing = _require_routed_expert_coverage(
             layer,
             set(linears),
             {
                 name
                 for name, wrapper in wrappers.items()
-                if wrapper.num_forwards > 0
+                if wrapper.num_optimization_rows > 0
             },
             "AutoRound",
             fused_names=fused_expert_linears,
+            unobserved_policy=policy.calibration.unobserved_policy,
         )
 
         results: dict[str, NativeQuantizedLayer] = {}
         with torch.no_grad():
             for name, wrapper in wrappers.items():
+                if name in missing:
+                    results[f"{layer_name}.{name}"] = _rtn_fallback(
+                        linears[name], policy, name, coverage, reason="no_optimization_input")
+                    continue
                 best_value, best_minimum, best_maximum = best_parameters[name]
                 wrapper.value.copy_(best_value.to(device))
                 wrapper.min_scale.copy_(best_minimum.to(device))
@@ -556,6 +660,7 @@ def quantize_layer_awq(
     policy: QuantizationPolicy,
     *,
     device: torch.device,
+    coverage: dict[str, int] | None = None,
 ) -> dict[str, NativeQuantizedLayer]:
     linears = selected_linears(layer_name, layer, policy)
     if not linears:
@@ -590,12 +695,18 @@ def quantize_layer_awq(
     finally:
         for handle in handles:
             handle.remove()
-    inputs = {name: torch.cat(values, dim=0) for name, values in features.items() if values}
-    _require_routed_expert_coverage(
+    inputs = {name: torch.cat(nonempty, dim=0)
+              for name, values in features.items()
+              if (nonempty := [value for value in values if value.numel()])}
+    for name in linears:
+        if name in inputs:
+            _observe_rows(coverage, name, inputs[name])
+    missing = _require_routed_expert_coverage(
         layer,
         set(linears),
         set(inputs),
         "AWQ",
+        unobserved_policy=policy.calibration.unobserved_policy,
     )
 
     for mapping in mappings:
@@ -605,11 +716,9 @@ def quantize_layer_awq(
         search_linears = [linears[name] for name in mapping.quantized_names]
         balance = [modules[name] for name in mapping.linear_names]
         inspect_module = modules[mapping.inspect_name]
-        kwargs = (
-            _forward_kwargs_for_submodule(inspect_module, samples[0][1], device)
-            if mapping.inspect_name.rsplit(".", 1)[-1] in {"self_attn", "attention", "attn", "linear_attn"}
-            else {}
-        )
+        # DeepSeek V4's first MoE blocks need input_ids for hash routing.
+        # Signature filtering keeps plain Linear calls free of model kwargs.
+        kwargs = _forward_kwargs_for_submodule(inspect_module, samples, device)
         scales = search_awq_scale(
             inspect_module,
             search_linears,
@@ -620,6 +729,7 @@ def quantize_layer_awq(
             duo_scaling=policy.awq.duo_scaling,
             n_grid=policy.awq.n_grid,
             max_chunk_memory=policy.awq.max_chunk_memory,
+            forward_batch_size=policy.awq.forward_batch_size,
         )
         apply_awq_scale(previous, balance, scales)
         for name in mapping.linear_names:
@@ -641,6 +751,10 @@ def quantize_layer_awq(
 
     results: dict[str, NativeQuantizedLayer] = {}
     for name, linear in linears.items():
+        if name in missing:
+            results[f"{layer_name}.{name}"] = _rtn_fallback(
+                linear, policy, name, coverage, reason="no_calibration_input")
+            continue
         quantized = pseudo_quantize_awq(
             linear.weight,
             bits=4,
@@ -670,10 +784,13 @@ def quantize_model_sequential(
     policy: QuantizationPolicy,
     *,
     device: torch.device,
+    report_path: str | Path | None = None,
 ) -> dict[str, NativeQuantizedLayer]:
     samples = first_layer_samples
     fp_samples = first_layer_samples
     all_results: dict[str, NativeQuantizedLayer] = {}
+    from flagos_compressor.calibration.reporting import CalibrationReport
+    reporter = CalibrationReport(report_path, policy, len(first_layer_samples)) if report_path is not None else None
     for layer_index, (layer_name, layer) in enumerate(layers, start=1):
         logger.info(
             "[%d/%d] %s calibration: %s",
@@ -682,31 +799,39 @@ def quantize_model_sequential(
             policy.method.upper(),
             layer_name,
         )
-        if policy.method == "gptq":
-            results = quantize_layer_gptq(
-                layer_name, layer, samples, policy, device=device
-            )
-        elif policy.method == "awq":
-            results = quantize_layer_awq(
-                layer_name, layer, samples, policy, device=device
-            )
-        elif policy.method == "autoround":
-            results, fp_samples, samples = quantize_layer_autoround(
-                layer_name,
-                layer,
-                fp_samples,
-                samples,
-                policy,
-                device=device,
-                layer_index=layer_index,
-            )
-        else:
-            raise ValueError(f"Sequential runner does not support {policy.method}")
-        all_results.update(results)
-        if policy.method != "autoround":
-            samples = forward_layer_samples(layer, samples, device=device)
+        context = (
+            reporter.layer(layer_name, selected_linears(layer_name, layer, policy))
+            if reporter is not None else nullcontext()
+        )
+        with context as coverage:
+            if policy.method == "gptq":
+                results = quantize_layer_gptq(
+                    layer_name, layer, samples, policy, device=device, coverage=coverage
+                )
+            elif policy.method == "awq":
+                results = quantize_layer_awq(
+                    layer_name, layer, samples, policy, device=device, coverage=coverage
+                )
+            elif policy.method == "autoround":
+                results, fp_samples, samples = quantize_layer_autoround(
+                    layer_name,
+                    layer,
+                    fp_samples,
+                    samples,
+                    policy,
+                    device=device,
+                    layer_index=layer_index,
+                    coverage=coverage,
+                )
+            else:
+                raise ValueError(f"Sequential runner does not support {policy.method}")
+            all_results.update(results)
+            if policy.method != "autoround":
+                samples = forward_layer_samples(layer, samples, device=device)
         layer.cpu()
         _empty_device_cache(device)
+    if reporter is not None:
+        reporter.complete(len(all_results))
     return all_results
 
 

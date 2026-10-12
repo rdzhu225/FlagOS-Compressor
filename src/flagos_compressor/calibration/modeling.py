@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import copy
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,7 @@ def load_transformers_model(
     from flagos_compressor.calibration.moe import linearize_fused_experts
 
     linearize_fused_experts(model)
+    preserve_norm_activation_dtype(model)
     config = getattr(model, "config", None)
     text_config = getattr(config, "text_config", config)
     if text_config is not None and hasattr(text_config, "use_cache"):
@@ -42,6 +44,27 @@ def load_transformers_model(
     if config is not None and hasattr(config, "use_cache"):
         config.use_cache = False
     return model, tokenizer
+
+
+def _norm_output_in_input_dtype(_module, args, output):
+    return output.to(args[0].dtype)
+
+
+def preserve_norm_activation_dtype(model: nn.Module) -> None:
+    """Keep DeepSeek V4's FP32 norm weights without promoting A16 outputs.
+
+    Transformers keeps these weights in FP32 on loading, but its eager RMSNorm
+    multiplies after casting the normalized input to A16. That multiplication
+    promotes the output back to FP32 and the next BF16 Linear rejects it.
+    Cast the final norm output while retaining both FP32 parameters and the
+    model's normalization implementation. Hooks also retain autograd support.
+    """
+    for module in model.modules():
+        if (module.__class__.__name__ == 'DeepseekV4RMSNorm'
+                and module.__class__.__module__.startswith('transformers.models.deepseek_v4.')
+                and not getattr(module, '_flagos_norm_dtype_hook', False)):
+            module.register_forward_hook(_norm_output_in_input_dtype)
+            module._flagos_norm_dtype_hook = True
 
 
 def decoder_layers(model: nn.Module) -> list[tuple[str, nn.Module]]:
@@ -91,6 +114,24 @@ def move_to_device(value: Any, device: torch.device) -> Any:
     if isinstance(value, dict):
         return {key: move_to_device(item, device) for key, item in value.items()}
     return value
+
+
+def prepare_forward_kwargs(
+    module: nn.Module, kwargs: dict[str, Any], device: torch.device
+) -> dict[str, Any]:
+    """Replay a calibration sample without mutating its captured KV cache.
+
+    Some models (including DeepSeek-V4 compressed attention) create a cache
+    even with use_cache=False. Reusing that object across GPTQ groups, AWQ
+    candidates or AutoRound iterations appends the same sequence repeatedly.
+    Preserve the captured cache type/configuration, but give each call its own
+    copy. Setting it to None changes compressed-attention behavior.
+    """
+    prepared = sanitize_kwargs(module, kwargs)
+    for name in ("past_key_values", "past_key_value"):
+        if prepared.get(name) is not None:
+            prepared[name] = copy.deepcopy(prepared[name])
+    return move_to_device(prepared, device)
 
 
 class _CapturedLayerInput(RuntimeError):
@@ -149,7 +190,7 @@ def forward_layer_samples(
     layer.to(device)
     for args, kwargs in samples:
         moved_args = move_to_device(args, device)
-        moved_kwargs = sanitize_kwargs(layer, move_to_device(kwargs, device))
+        moved_kwargs = prepare_forward_kwargs(layer, kwargs, device)
         output = layer(*moved_args, **moved_kwargs)
         hidden = output[0] if isinstance(output, (tuple, list)) else output
         if hasattr(output, "last_hidden_state"):
@@ -164,5 +205,6 @@ __all__ = [
     "forward_layer_samples",
     "load_transformers_model",
     "move_to_device",
+    "prepare_forward_kwargs",
     "sanitize_kwargs",
 ]

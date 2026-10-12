@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import re
 
 from flagos_compressor.core.profile import TensorInfo
@@ -27,8 +27,11 @@ class CalibrationPolicy:
     split: str = "train"
     text_column: str = "text"
     trust_remote_code: bool = False
+    unobserved_policy: str = "error"
 
     def __post_init__(self) -> None:
+        if self.unobserved_policy not in {"error", "rtn"}:
+            raise ValueError("calibration.unobserved_policy must be error or rtn")
         if self.samples <= 0 or self.sequence_length <= 0:
             raise ValueError("calibration samples and sequence_length must be positive")
         if not self.split or not self.text_column:
@@ -67,6 +70,7 @@ class AWQPolicy:
     apply_clip: bool = True
     n_grid: int = 20
     max_chunk_memory: int = 1024 * 1024 * 1024
+    forward_batch_size: int | None = None
 
     def __post_init__(self) -> None:
         normalized = self.version.lower()
@@ -75,6 +79,8 @@ class AWQPolicy:
             raise ValueError("Only AutoAWQ GEMM checkpoint format is currently supported")
         if self.n_grid <= 0 or self.max_chunk_memory <= 0:
             raise ValueError("awq.n_grid and max_chunk_memory must be positive")
+        if self.forward_batch_size is not None and self.forward_batch_size <= 0:
+            raise ValueError("awq.forward_batch_size must be positive")
 
 
 @dataclass(frozen=True)
@@ -286,8 +292,13 @@ class QuantizationPolicy:
         if self.method not in {"mse", "gptq", "awq", "autoround"}:
             raise ValueError("method must be one of: mse, gptq, awq, autoround")
         if self.target_scheme_rules:
-            if self.method != "mse":
-                raise ValueError("Selector-local rules currently require method='mse'")
+            if self.method not in {"mse", "gptq"}:
+                raise ValueError("Selector-local rules require method='mse' or 'gptq'")
+            if self.method == "gptq" and any(
+                rule.activation_num_bits != 16 or rule.strategy != "group"
+                for rule in self.target_scheme_rules
+            ):
+                raise ValueError("GPTQ selector-local rules require groupwise W4A16/W8A16")
             if self.selections or self.include_names:
                 raise ValueError(
                     "Selector-local rules cannot be combined with legacy selections"
@@ -394,19 +405,34 @@ class QuantizationPolicy:
         """Return the last matching rule, after applying global exclusions."""
         if tensor.role != "weight" or not self.target_scheme_rules:
             return None
-        tags = tuple(tensor.tags)
+        return self.target_scheme_rule_for_name(tensor.name, tensor.tags)
+
+    def target_scheme_rule_for_name(self, name: str, tags: tuple[str, ...]) -> TargetSchemeRule | None:
+        """Resolve checkpoint and live-module names with the same last-rule-wins contract."""
         if any(
             BUILTIN_SELECTIONS[item] in set(tags)
             for item in self.exclude_selections
         ):
             return None
-        if any(re.search(pattern, tensor.name) for pattern in self.exclude_names):
+        if any(re.search(pattern, name) for pattern in self.exclude_names):
             return None
         return next(
             (
                 rule
                 for rule in reversed(self.target_scheme_rules)
-                if rule.matches_name(tensor.name, tags)
+                if rule.matches_name(name, tags)
             ),
             None,
         )
+
+    def settings_for_name(self, name: str, tags: tuple[str, ...]) -> QuantizationPolicy:
+        """Algorithm settings for an already selected logical weight."""
+        if not self.target_scheme_rules:
+            return self
+        rule = self.target_scheme_rule_for_name(name, tags)
+        if rule is None:
+            raise ValueError(f"No quantization rule selects {name}")
+        return replace(self, target_scheme_rules=(), num_bits=rule.num_bits,
+                       activation_num_bits=rule.activation_num_bits,
+                       strategy=rule.strategy, group_size=rule.group_size,
+                       chunk_size=rule.chunk_size)

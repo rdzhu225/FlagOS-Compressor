@@ -103,6 +103,10 @@ def build_parser() -> argparse.ArgumentParser:
     quantize.add_argument("--calibration-split")
     quantize.add_argument("--calibration-text-column")
     quantize.add_argument(
+        "--calibration-unobserved-policy", choices=["error", "rtn"],
+        help="Zero-coverage routed experts: fail (default), or explicitly export RTN fallback weights.",
+    )
+    quantize.add_argument(
         "--trust-remote-code",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -147,6 +151,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     quantize.add_argument("--awq-n-grid", type=int)
     quantize.add_argument("--awq-max-chunk-memory", type=int)
+    quantize.add_argument("--awq-forward-batch-size", type=int,
+                         help="Maximum sequence batch per AWQ scale-search forward; all calibration samples remain included.")
     quantize.add_argument("--autoround-iters", type=int)
     quantize.add_argument(
         "--autoround-config",

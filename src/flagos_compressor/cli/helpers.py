@@ -400,6 +400,7 @@ def _build_calibration_policy(
             "split",
             "text_column",
             "trust_remote_code",
+            "unobserved_policy",
         },
     )
 
@@ -434,6 +435,7 @@ def _build_calibration_policy(
         seed=int(value("calibration_seed", "seed", 42)),
         split=str(value("calibration_split", "split", "train")),
         text_column=str(value("calibration_text_column", "text_column", "text")),
+        unobserved_policy=str(value("calibration_unobserved_policy", "unobserved_policy", "error")),
         trust_remote_code=bool(
             value("trust_remote_code", "trust_remote_code", False)
         ),
@@ -489,6 +491,7 @@ def _build_awq_policy(args, recipe: dict) -> AWQPolicy:
             "apply_clip",
             "n_grid",
             "max_chunk_memory",
+            "forward_batch_size",
         },
     )
 
@@ -505,6 +508,8 @@ def _build_awq_policy(args, recipe: dict) -> AWQPolicy:
         max_chunk_memory=int(
             value("awq_max_chunk_memory", "max_chunk_memory", 1024 * 1024 * 1024)
         ),
+        forward_batch_size=(int(value("awq_forward_batch_size", "forward_batch_size", None))
+                            if value("awq_forward_batch_size", "forward_batch_size", None) is not None else None),
     )
 
 
@@ -651,12 +656,13 @@ def build_quantization_policy(args) -> QuantizationPolicy:
                 + ", ".join(conflicts)
             )
         requested_method = getattr(args, "method", None) or recipe.get("method")
-        if requested_method not in (None, "mse"):
-            raise ValueError("Selector-local rules currently support only --method mse")
+        if requested_method not in (None, "mse", "gptq"):
+            raise ValueError("Selector-local rules support --method mse or gptq")
         requested_format = getattr(args, "format", None) or recipe.get("format")
-        if requested_format not in (None, "compressed-tensors"):
+        expected_format = "gptq" if requested_method == "gptq" else "compressed-tensors"
+        if requested_format not in (None, expected_format):
             raise ValueError(
-                "Selector-local rules require --format compressed-tensors"
+                f"Selector-local {requested_method or 'mse'} rules require --format {expected_format}"
             )
 
     def value(name: str, default):

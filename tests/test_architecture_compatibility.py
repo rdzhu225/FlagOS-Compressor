@@ -9,6 +9,7 @@ from flagos_compressor.calibration.modeling import (
     capture_first_layer_inputs,
     decoder_layers,
     sanitize_kwargs,
+    preserve_norm_activation_dtype,
 )
 from flagos_compressor.calibration.moe import linearize_fused_experts
 from flagos_compressor.calibration.runner import (
@@ -35,13 +36,14 @@ def _policy(method: str) -> QuantizationPolicy:
     )
 
 
-def _run_tiny_model(model, method: str) -> dict:
+def _run_tiny_model(model, method: str, sequence_length: int = 8) -> dict:
     linearize_fused_experts(model)
+    preserve_norm_activation_dtype(model)
     layers = decoder_layers(model)
     batches = [
         {
-            "input_ids": torch.randint(0, model.config.vocab_size, (1, 8)),
-            "attention_mask": torch.ones(1, 8, dtype=torch.long),
+            "input_ids": torch.randint(0, model.config.vocab_size, (1, sequence_length)),
+            "attention_mask": torch.ones(1, sequence_length, dtype=torch.long),
         }
         for _ in range(2)
     ]
@@ -187,7 +189,13 @@ def test_tiny_glm4_and_deepseek_v2_v3_run_all_calibrators():
             assert quantized
 
 
-def test_tiny_deepseek_v4_preserves_forward_kwargs_and_runs_calibrators():
+@pytest.mark.parametrize("method", ["gptq", "awq", "autoround"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("mlp_type", ["moe", "hash_moe"])
+@pytest.mark.parametrize("layer_type", [
+    "sliding_attention", "compressed_sparse_attention", "heavily_compressed_attention",
+])
+def test_tiny_deepseek_v4_preserves_forward_kwargs_and_runs_calibrators(method, layer_type, dtype, mlp_type):
     import transformers
 
     if not hasattr(transformers, "DeepseekV4Config"):
@@ -203,34 +211,47 @@ def test_tiny_deepseek_v4_preserves_forward_kwargs_and_runs_calibrators():
             num_hidden_layers=1,
             num_attention_heads=2,
             num_key_value_heads=1,
-            head_dim=8,
+            head_dim=16,
+            qk_rope_head_dim=4,
             q_lora_rank=8,
             num_experts_per_tok=1,
             n_routed_experts=2,
             n_shared_experts=1,
-            max_position_embeddings=32,
-            layer_types=["sliding_attention"],
-            mlp_layer_types=["moe"],
+            max_position_embeddings=512,
+            layer_types=[layer_type],
+            mlp_layer_types=[mlp_type],
             hc_mult=2,
             hc_sinkhorn_iters=2,
             o_groups=2,
-            o_lora_rank=4,
+            o_lora_rank=8,
             index_n_heads=2,
             index_head_dim=8,
             index_topk=2,
             num_nextn_predict_layers=0,
             use_cache=False,
         )
-        return DeepseekV4ForCausalLM(config).eval()
+        model = DeepseekV4ForCausalLM(config).eval().to(dtype)
+        # Reproduce from_pretrained's strict FP32 exclusions with A16 linears.
+        strict = set(model._keep_in_fp32_modules_strict)
+        for name, parameter in model.named_parameters():
+            if any(part in strict for part in name.split('.')):
+                parameter.data = parameter.data.float()
+        if mlp_type == "hash_moe":
+            # Real checkpoints supply this table; the test model initializes
+            # it to zero, which would deliberately leave expert 1 unobserved.
+            table = model.model.layers[0].mlp.gate.tid2eid
+            table.copy_((torch.arange(config.vocab_size) % 2).unsqueeze(-1))
+        return model
 
-    for method in ("gptq", "awq", "autoround"):
-        torch.manual_seed(11)
-        model = factory()
-        linearize_fused_experts(model)
-        layer_name, layer = decoder_layers(model)[0]
-        selected = selected_linears(layer_name, layer, _policy(method))
+    torch.manual_seed(11)
+    model = factory()
+    linearize_fused_experts(model)
+    layer_name, layer = decoder_layers(model)[0]
+    selected = selected_linears(layer_name, layer, _policy(method))
 
-        assert "self_attn.kv_proj" in selected
-        assert "self_attn.o_b_proj" in selected
-        assert "self_attn.o_a_proj" not in selected
-        assert _run_tiny_model(factory(), method)
+    assert "self_attn.kv_proj" in selected
+    assert "self_attn.o_b_proj" in selected
+    assert "self_attn.o_a_proj" not in selected
+    # Cross the 128-token compression/window boundary. Eight-token tests did
+    # not reveal cache accumulation between repeated calibration forwards.
+    assert _run_tiny_model(factory(), method, sequence_length=256)

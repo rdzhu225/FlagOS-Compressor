@@ -26,7 +26,9 @@ def _read_local_text(path: Path, text_column: str) -> list[str]:
     if suffix == ".jsonl":
         records = [
             json.loads(line)
-            for line in path.read_text(encoding="utf-8").splitlines()
+            # Unicode line/paragraph separators are valid inside JSON strings;
+            # only newline characters delimit JSONL records.
+            for line in path.read_text(encoding="utf-8").split("\n")
             if line.strip()
         ]
     elif suffix == ".json":
