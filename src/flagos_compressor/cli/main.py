@@ -138,6 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--awq-zero-point",
         action=argparse.BooleanOptionalAction,
         default=None,
+        help="Use AWQ asymmetric W4 (default). Use --no-awq-zero-point for symmetric W4/W8 mixed checkpoints on vLLM AutoGPTQ.",
     )
     quantize.add_argument(
         "--awq-duo-scaling",

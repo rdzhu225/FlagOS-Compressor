@@ -292,13 +292,11 @@ class QuantizationPolicy:
         if self.method not in {"mse", "gptq", "awq", "autoround"}:
             raise ValueError("method must be one of: mse, gptq, awq, autoround")
         if self.target_scheme_rules:
-            if self.method not in {"mse", "gptq"}:
-                raise ValueError("Selector-local rules require method='mse' or 'gptq'")
-            if self.method == "gptq" and any(
+            if self.method != "mse" and any(
                 rule.activation_num_bits != 16 or rule.strategy != "group"
                 for rule in self.target_scheme_rules
             ):
-                raise ValueError("GPTQ selector-local rules require groupwise W4A16/W8A16")
+                raise ValueError("Calibrated selector-local rules require groupwise W4A16/W8A16")
             if self.selections or self.include_names:
                 raise ValueError(
                     "Selector-local rules cannot be combined with legacy selections"
@@ -306,12 +304,12 @@ class QuantizationPolicy:
         expected_format = {
             "mse": "compressed-tensors",
             "gptq": "gptq",
-            "awq": "awq",
+            "awq": "gptq" if self.target_scheme_rules else "awq",
             "autoround": "gptq",
         }[self.method]
         if self.format is None:
             object.__setattr__(self, "format", expected_format)
-        elif self.format != expected_format:
+        elif self.format != expected_format and not (self.method == "awq" and self.format == "gptq"):
             raise ValueError(
                 f"method={self.method!r} requires format={expected_format!r}"
             )
@@ -321,9 +319,9 @@ class QuantizationPolicy:
             raise ValueError("activation_num_bits must be 8 or 16")
         if self.method in {"gptq", "awq", "autoround"} and self.activation_num_bits != 16:
             raise ValueError(f"{self.method.upper()} currently supports weight-only A16")
-        if self.method == "awq" and self.num_bits != 4:
+        if self.method == "awq" and self.format == "awq" and self.num_bits != 4:
             raise ValueError("AutoAWQ GEMM currently supports only 4-bit weights")
-        if self.method == "awq" and not self.awq.zero_point:
+        if self.method == "awq" and self.format == "awq" and not self.awq.zero_point:
             raise ValueError("Native AutoAWQ GEMM requires awq.zero_point=true")
         if self.method == "autoround" and not self.gptq.symmetric:
             raise ValueError("Native AutoRound currently requires symmetric weights")

@@ -81,6 +81,7 @@ def _patch_config(
     unquantized_modules: list[str],
     fallbacks: dict[str, dict[str, str]] | None = None,
     module_quantization: dict[str, dict[str, int]] | None = None,
+    packing_format: str | None = None,
 ) -> dict[str, Any]:
     config_path = output_path / "config.json"
     if not config_path.exists():
@@ -92,7 +93,7 @@ def _patch_config(
     # class whose state dict was actually exported.
     config["architectures"] = [model.__class__.__name__]
     config.pop("compression_config", None)
-    if method in {"gptq", "autoround"}:
+    if method in {"gptq", "autoround"} or packing_format == "gptq":
         quantization_config = {
             "bits": bits,
             "group_size": group_size,
@@ -121,6 +122,11 @@ def _patch_config(
                 for name, settings in module_quantization.items()
                 if settings != {"bits": bits, "group_size": group_size}
             })
+        if method == "awq":
+            quantization_config.update(algorithm="awq", provider="flagos-compressor",
+                sym=not awq_zero_point, desc_act=False, true_sequential=False,
+                static_groups=False, zero_point=awq_zero_point,
+                packing_description="GPTQ tensor ABI; calibrated by AWQ, W8 symmetric and W4 follows awq.zero_point")
         if method == "autoround":
             # Keep the loader-facing ABI canonical while recording the native
             # algorithm independently from its GPTQ-compatible packing.
@@ -210,7 +216,8 @@ def save_native_quantized_model(
             f"Native {method.upper()} export received tensors from another method: "
             f"{mismatched[:3]}"
         )
-    expected_packing = "gptq" if method in {"gptq", "autoround"} else "awq"
+    expected_packing = "gptq" if method in {"gptq", "autoround"} or all(
+        isinstance(result.packed, AutoGPTQPacked) for result in quantized.values()) else "awq"
     packing_mismatches = sorted(
         name
         for name, result in quantized.items()
@@ -226,10 +233,15 @@ def save_native_quantized_model(
                "group_size": result.group_size if result.group_size is not None else group_size}
         for name, result in quantized.items()
     }
+    if method == "awq" and expected_packing == "gptq":
+        for name, settings in schemes.items():
+            if quantized[name].symmetric is None:
+                raise ValueError(f"AWQ GPTQ packing requires explicit symmetry metadata for {name}")
+            settings['sym'] = quantized[name].symmetric
     per_module = any(value != {"bits": bits, "group_size": group_size} for value in schemes.values())
-    if per_module and method != "gptq":
-        raise ValueError("Per-module native export currently supports GPTQ only")
-    if method == "gptq":
+    if per_module and expected_packing != "gptq":
+        raise ValueError("Per-module native export requires GPTQ-compatible packing")
+    if expected_packing == "gptq":
         from flagos_compressor.core.compressed_tensors import validate_fusion_closure
         from collections import defaultdict
         by_scheme = defaultdict(set)
@@ -246,7 +258,7 @@ def save_native_quantized_model(
                     or tuple(packed.scales.shape) != (in_features // module_group, out_features)
                     or tuple(packed.qzeros.shape) != (in_features // module_group, out_features // factor)):
                 raise ValueError(f"Packed GPTQ tensors disagree with module scheme for {name}")
-            by_scheme[(module_bits, module_group)].add(name + '.weight')
+            by_scheme[(module_bits, module_group, settings.get('sym', symmetric))].add(name + '.weight')
         if per_module:
             all_weights = [name + '.weight' for name in _runtime_linear_names(model)]
             for members in by_scheme.values():
@@ -341,6 +353,7 @@ def save_native_quantized_model(
         unquantized_modules=unquantized_modules,
         fallbacks=fallbacks,
         module_quantization=schemes if per_module else None,
+        packing_format=expected_packing,
     )
     external_config_name = (
         "quantize_config.json"

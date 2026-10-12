@@ -656,10 +656,10 @@ def build_quantization_policy(args) -> QuantizationPolicy:
                 + ", ".join(conflicts)
             )
         requested_method = getattr(args, "method", None) or recipe.get("method")
-        if requested_method not in (None, "mse", "gptq"):
-            raise ValueError("Selector-local rules support --method mse or gptq")
+        if requested_method not in (None, "mse", "gptq", "awq", "autoround"):
+            raise ValueError("Unknown selector-local quantization method")
         requested_format = getattr(args, "format", None) or recipe.get("format")
-        expected_format = "gptq" if requested_method == "gptq" else "compressed-tensors"
+        expected_format = "gptq" if requested_method in {"gptq", "awq", "autoround"} else "compressed-tensors"
         if requested_format not in (None, expected_format):
             raise ValueError(
                 f"Selector-local {requested_method or 'mse'} rules require --format {expected_format}"

@@ -118,9 +118,10 @@ def test_cli_resolves_gptq_local_schemes_and_last_shared_override():
 
 
 @pytest.mark.parametrize('method', ['awq', 'autoround'])
-def test_other_calibration_algorithms_do_not_silently_accept_mixed_rules(method):
-    with pytest.raises(ValueError, match='Selector-local'):
-        replace(policy(), method=method)
+def test_other_calibration_algorithms_accept_explicit_mixed_rules(method):
+    settings = replace(policy(), method=method, format=None)
+    assert settings.format == 'gptq'
+    assert settings.settings_for_name('model.layers.0.self_attn.q_a_proj.weight', ('attention',)).num_bits == 8
 
 
 def test_gptq_rejects_channelwise_activation_quantization():

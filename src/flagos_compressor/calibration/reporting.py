@@ -54,6 +54,8 @@ class CalibrationReport:
                 record["module_quantization"][module_name] = {
                     "bits": settings.num_bits, "group_size": settings.group_size,
                 }
+                if self.policy.method == "awq":
+                    record["module_quantization"][module_name]['sym'] = not (settings.awq.zero_point and settings.num_bits == 4)
         self.data["layers"].append(record)
         self.save()
         started = time.monotonic()

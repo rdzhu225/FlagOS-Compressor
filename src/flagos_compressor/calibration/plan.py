@@ -38,6 +38,8 @@ def build_calibration_plan(layers, policy):
                 "group_size": resolved.group_size, "shape": list(linear.weight.shape),
                 "dtype_before_quantization": str(linear.weight.dtype),
             }
+            if policy.method == "awq":
+                selected[f"{layer_name}.{name}"]['sym'] = not (resolved.awq.zero_point and resolved.num_bits == 4)
         validate_layer_schemes(layer_name, layer, settings)
         for name, module in layer.named_modules():
             weight = getattr(module, "weight", None)

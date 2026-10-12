@@ -367,6 +367,7 @@ def validate_artifact(model_path: str | Path) -> dict:
             for qweight_name in qweights:
                 prefix = qweight_name[: -len(".qweight")]
                 bits, group_size = base_bits, base_group_size
+                symmetric = quant_config.get("sym", True)
                 if candidate_method == "gptq":
                     import re
                     for pattern, overrides in (quant_config.get("dynamic") or {}).items():
@@ -376,9 +377,13 @@ def validate_artifact(model_path: str | Path) -> dict:
                             else:
                                 bits = overrides.get("bits", bits)
                                 group_size = overrides.get("group_size", group_size)
+                                symmetric = overrides.get("sym", symmetric)
                             break
                     declared = (quant_config.get("flagos_module_quantization") or {}).get(prefix)
-                    if declared is not None and declared != {"bits": bits, "group_size": group_size}:
+                    effective = {"bits": bits, "group_size": group_size}
+                    if declared is not None and 'sym' in declared:
+                        effective['sym'] = symmetric
+                    if declared is not None and declared != effective:
                         errors.append(f"GPTQ dynamic override disagrees with module declaration: {prefix}")
                 if bits not in (4, 8) or group_size <= 0:
                     errors.append(f"Invalid native quantization scheme for {prefix}")

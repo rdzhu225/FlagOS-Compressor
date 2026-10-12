@@ -30,8 +30,8 @@ def pseudo_quantize_awq(
     """Match AutoAWQ ``pseudo_quantize_tensor`` for a 2D weight."""
     if weight.dim() != 2:
         raise ValueError("AWQ requires a 2D weight")
-    if bits != 4:
-        raise ValueError("AutoAWQ GEMM currently supports 4-bit weights")
+    if bits not in (4, 8):
+        raise ValueError("AWQ calibration supports 4-bit and 8-bit weights")
     original_shape = weight.shape
     if group_size <= 0:
         group_size = int(original_shape[-1])
@@ -103,11 +103,16 @@ def search_awq_scale(
     n_grid: int = 20,
     max_chunk_memory: int = 1024 * 1024 * 1024,
     forward_batch_size: int | None = None,
+    linear_schemes: list[tuple[int, int, bool]] | None = None,
 ) -> torch.Tensor:
     """Run AutoAWQ's output-MSE grid search for one scaling relationship."""
     linears = list(linears)
     if not linears:
         raise ValueError("AWQ scale search requires at least one Linear")
+    schemes = linear_schemes if linear_schemes is not None else [(4, group_size, zero_point)] * len(linears)
+    if len(schemes) != len(linears) or any(bits not in (4, 8) or group <= 0 or linear.in_features % group
+            for linear, (bits, group, _) in zip(linears, schemes)):
+        raise ValueError("AWQ scale search requires one valid scheme per Linear")
     kwargs = dict(kwargs or {})
     kwargs.pop("use_cache", None)
     device = next(module.parameters()).device
@@ -121,12 +126,17 @@ def search_awq_scale(
     ranges = [(start, min(start + batch_step, inputs.shape[0]))
               for start in range(0, inputs.shape[0], batch_step)]
 
-    weight = torch.cat([linear.weight for linear in linears], dim=0)
-    original_shape = weight.shape
-    normalized = weight.view(-1, group_size)
-    normalized = normalized.abs() / (normalized.abs().amax(dim=1, keepdim=True) + 1e-6)
-    weight_mean = normalized.view(original_shape).mean(dim=0).float()
-    del weight, normalized
+    # Compute each projection's statistics using its actual group size. The
+    # shared scaling relationship may include W4 routed and W8 shared experts.
+    weight_sum = torch.zeros(linears[0].in_features, device=device, dtype=torch.float32)
+    weight_rows = 0
+    for linear, (_, local_group, _) in zip(linears, schemes):
+        normalized = linear.weight.view(-1, local_group).abs()
+        normalized = normalized / (normalized.amax(dim=1, keepdim=True) + 1e-6)
+        weight_sum.add_(normalized.view_as(linear.weight).sum(dim=0).float())
+        weight_rows += linear.out_features
+    weight_mean = weight_sum / weight_rows
+    del normalized, weight_sum
     input_sum = torch.zeros(inputs.shape[-1], device=device, dtype=torch.float32)
     for start, stop in ranges:
         values = inputs[start:stop].detach().to(device).reshape(-1, inputs.shape[-1])
@@ -172,14 +182,14 @@ def search_awq_scale(
         scale_view = scales.to(device).view(1, -1)
 
         try:
-            for linear in linears:
+            for linear, (local_bits, local_group, local_zero_point) in zip(linears, schemes):
                 scaled = linear.weight.data * scale_view
                 linear.weight.copy_(
                     pseudo_quantize_awq(
                         scaled,
-                        bits=4,
-                        group_size=group_size,
-                        zero_point=zero_point,
+                        bits=local_bits,
+                        group_size=local_group,
+                        zero_point=local_zero_point,
                     ).weight
                     / scale_view
                 )
@@ -214,6 +224,7 @@ def search_awq_clip(
     max_shrink: float = 0.5,
     sample_tokens: int = 512,
     output_chunk_size: int = 256,
+    bits: int = 4,
 ) -> torch.Tensor:
     """Return AutoAWQ per-output/per-group symmetric clipping maxima."""
     if weight.dim() != 2 or inputs.shape[-1] != weight.shape[1]:
@@ -239,7 +250,7 @@ def search_awq_clip(
             clipped = torch.clamp(current, -candidate_maximum, candidate_maximum)
             fake = pseudo_quantize_awq(
                 clipped.reshape(-1, group_size),
-                bits=4,
+                bits=bits,
                 group_size=group_size,
                 zero_point=zero_point,
             ).weight.reshape_as(clipped)
