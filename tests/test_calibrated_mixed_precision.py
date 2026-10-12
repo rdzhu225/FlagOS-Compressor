@@ -102,3 +102,23 @@ def test_awq_joint_scale_search_uses_each_projection_scheme(monkeypatch):
     seen.clear()
     awq.search_awq_clip(pair.b.weight, torch.randn(8, 16), bits=8, group_size=16, zero_point=False, n_grid=4)
     assert seen and all(item == (8, 16, False) for item in seen)
+
+
+def test_awq_w8_base_config_matches_symmetric_packed_weights(tmp_path):
+    block = MixedBlock()
+    model = nn.Module(); model.model = nn.Module(); model.model.layers = nn.ModuleList([block])
+    settings = replace(policy(), method='awq', format='gptq', num_bits=8,
+        target_scheme_rules=(), selections=('attention',), group_size=8, awq=AWQPolicy(n_grid=4))
+    results = quantize_model_sequential([('model.layers.0', block)],
+        [((torch.randn(1, 16, 8),), {})], settings, device=torch.device('cpu'))
+    assert len(results) == 3 and all(result.symmetric for result in results.values())
+    source = tmp_path/'source'; source.mkdir()
+    save_file({'dummy': torch.ones(1)}, source/'model.safetensors')
+    (source/'config.json').write_text(json.dumps({'model_type': 'toy'}))
+    output = tmp_path/'output'
+    save_native_quantized_model(source, output, model, results, method='awq', bits=8, group_size=8)
+    quant = json.loads((output/'config.json').read_text())['quantization_config']
+    # The loader constructs its base config before applying dynamic overrides.
+    assert quant['bits'] == 8 and quant['sym'] is True
+    assert all(scheme['sym'] for scheme in quant['flagos_module_quantization'].values())
+    assert validate_artifact(output)['valid']

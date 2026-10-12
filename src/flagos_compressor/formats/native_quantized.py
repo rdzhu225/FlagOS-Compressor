@@ -124,7 +124,7 @@ def _patch_config(
             })
         if method == "awq":
             quantization_config.update(algorithm="awq", provider="flagos-compressor",
-                sym=not awq_zero_point, desc_act=False, true_sequential=False,
+                sym=bits == 8 or not awq_zero_point, desc_act=False, true_sequential=False,
                 static_groups=False, zero_point=awq_zero_point,
                 packing_description="GPTQ tensor ABI; calibrated by AWQ, W8 symmetric and W4 follows awq.zero_point")
         if method == "autoround":
