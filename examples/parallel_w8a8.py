@@ -22,6 +22,7 @@ import flagos_compressor.formats.register  # noqa: F401
 import flagos_compressor.quantizers.register  # noqa: F401
 from flagos_compressor.backends.registry import build_backend
 from flagos_compressor.cli.helpers import ensure_no_unmatched
+from flagos_compressor.cli.quantize import _load_moe_layout
 from flagos_compressor.core.executor import (
     _QUANTIZED_FORMAT_BITS, _patch_compressed_tensors_config,
     _write_quantization_manifest, execute_plan,
@@ -31,6 +32,7 @@ from flagos_compressor.core.planner import build_quantize_plan
 from flagos_compressor.core.policy import QuantizationPolicy
 from flagos_compressor.core.profile import ModelProfile
 from flagos_compressor.core.report import ConversionReport, OpEvent
+from flagos_compressor.core.validation import validate_artifact
 from flagos_compressor.io.hf_checkpoint import HfSafetensorsCheckpoint
 from flagos_compressor.inspect.checkpoint_scanner import scan_hf_safetensors
 
@@ -39,7 +41,9 @@ def initialize(profile_path, policy_dict, gpu_queue):
     global PROFILE, PLAN, DEVICE
     torch.set_num_threads(2)
     PROFILE = ModelProfile.from_dict(json.loads(Path(profile_path).read_text()))
-    PLAN = build_quantize_plan(PROFILE, QuantizationPolicy(**policy_dict))
+    policy = QuantizationPolicy(**policy_dict)
+    layout = _load_moe_layout(PROFILE.model_path, PROFILE, policy)
+    PLAN = build_quantize_plan(PROFILE, policy, layout)
     DEVICE = gpu_queue.get()
     torch.cuda.set_device(DEVICE)
 
@@ -108,7 +112,8 @@ def main():
         exclude_names=tuple(args.exclude_name), num_bits=8, activation_num_bits=8,
         strategy="channel", n_candidates=args.n_candidates,
     )
-    plan = build_quantize_plan(profile, policy)
+    layout = _load_moe_layout(str(source), profile, policy)
+    plan = build_quantize_plan(profile, policy, layout)
     ensure_no_unmatched(plan)
     for action in plan.actions:
         for aux in (action.tensor.scale_name, *action.tensor.auxiliary_names):
@@ -158,6 +163,10 @@ def main():
     combined.finish()
     combined.save(output / "quantization_report.json")
     shutil.rmtree(output / ".parts", ignore_errors=False)
+    validation = validate_artifact(output)
+    (work / "validation.json").write_text(json.dumps(validation, indent=2))
+    if not validation["valid"]:
+        raise RuntimeError(f"Output validation failed: {validation['errors'][:5]}")
     (output / "_INCOMPLETE").unlink()
     print("COMPLETE", json.dumps({"output": str(output), "bytes": size,
                                   "converted": combined.converted,
