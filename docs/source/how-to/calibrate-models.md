@@ -109,6 +109,15 @@ flagos-compressor quantize \
 
 Source FP4 or FP8 weights are staged as BF16 before Transformers loads the calibration model. In Transformers-v5 scenarios, fused experts may be temporarily exposed as per-expert `nn.Linear` modules for calibration.
 
+Checkpoint-native FP32 parameters and buffers are restored from the source if
+model loading casts them to a lower precision. This happens before calibration;
+unquantized tensors retain that precision in native export.
+
+For MiMo-V2 models, calibration discovers the decoder blocks directly and
+prepares each layer's global or sliding-window attention mask and RoPE inputs.
+GPTQ, AWQ, and AutoRound share this preparation, including both AutoRound input
+streams. Text calibration uses no KV cache.
+
 ## Control sampling
 
 Use these options to make calibration reproducible:

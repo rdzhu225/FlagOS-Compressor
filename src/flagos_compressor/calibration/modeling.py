@@ -10,6 +10,29 @@ import torch
 from torch import nn
 
 
+@torch.no_grad()
+def _restore_source_fp32(model: nn.Module, model_path: str | Path) -> None:
+    """Recover source FP32 tensors rounded by Transformers' model-wide dtype.
+
+    Casting the loaded tensor back to FP32 cannot recover its original values.
+    Restore from the checkpoint before calibration and expert linearization;
+    native export will then retain the dtype through the model state dict.
+    """
+    from flagos_compressor.io.hf_checkpoint import HfSafetensorsCheckpoint
+
+    checkpoint = HfSafetensorsCheckpoint(model_path)
+    state = model.state_dict(keep_vars=True)
+    for name, _shard, metadata in checkpoint.iter_tensor_metadata():
+        tensor = state.get(name)
+        if metadata["dtype"] != "F32" or tensor is None:
+            continue
+        if tensor.dtype == torch.float32:
+            continue
+        if list(tensor.shape) != metadata["shape"]:
+            raise ValueError(f"Source FP32 tensor {name} changed shape during loading")
+        tensor.data = checkpoint.load_tensor(name).to(device=tensor.device)
+
+
 def load_transformers_model(
     model_path: str | Path,
     *,
@@ -27,6 +50,7 @@ def load_transformers_model(
         low_cpu_mem_usage=False,
         trust_remote_code=trust_remote_code,
     )
+    _restore_source_fp32(model, model_path)
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
         trust_remote_code=trust_remote_code,
@@ -46,6 +70,12 @@ def load_transformers_model(
 
 def decoder_layers(model: nn.Module) -> list[tuple[str, nn.Module]]:
     """Discover ordered decoder blocks using the Transformers no-split contract."""
+    if getattr(getattr(model, "config", None), "model_type", None) == "mimo_v2":
+        # MiMo's remote model exposes its blocks but no _no_split_modules.
+        return [
+            (f"model.layers.{index}", layer)
+            for index, layer in enumerate(model.model.layers)
+        ]
     try:
         class_names = set(model._get_no_split_modules("auto"))
     except AttributeError:
