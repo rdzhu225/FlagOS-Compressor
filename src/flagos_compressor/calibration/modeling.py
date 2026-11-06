@@ -19,7 +19,7 @@ def load_transformers_model(
         from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as exc:
         raise RuntimeError(
-            "GPTQ/AWQ/AutoRound model calibration requires transformers>=5,<6"
+            "GPTQ/AWQ/AutoRound model calibration requires transformers>=5.20.2,<6"
         ) from exc
     model = AutoModelForCausalLM.from_pretrained(
         model_path,

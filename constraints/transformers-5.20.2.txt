@@ -1,0 +1,8 @@
+# Calibration dependency baseline; install the appropriate PyTorch separately.
+# This constrains the HF stack, not the complete accelerator environment.
+transformers==5.20.2
+huggingface-hub==1.31.0
+tokenizers==0.23.1
+safetensors==0.8.0
+click==8.4.2
+hf-xet==1.8.0

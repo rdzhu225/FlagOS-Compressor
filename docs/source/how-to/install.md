@@ -34,6 +34,30 @@ The official AutoRound Python entry point is loaded lazily only when an
 explicit reference or parity workflow requests it. Normal installation and
 native FlagOS-Compressor execution do not import the optional package.
 
+## Reproduce the calibration dependency baseline
+
+The minimum Transformers version is 5.20.2. This baseline includes DeepSeek-V4
+cache-free forward execution and the RMSNorm fix that preserves the activation
+dtype while retaining FP32 norm weights. Python 3.10 remains supported.
+
+To reproduce this HF dependency combination in a separate environment:
+
+```bash
+python -m pip install -c constraints/transformers-5.20.2.txt -e .
+python -m pip check
+```
+
+Install the PyTorch build for your backend before this command. The constraint
+file fixes the HF stack; it is not a complete CUDA, vLLM, or accelerator lockfile.
+Keep the exact PyTorch, runtime, model revision, and calibration inputs with each
+experiment. A dependency range allowing a newer release does not certify that
+release against every supported model.
+
+Upgrade in a separate environment when reproducing earlier calibration results.
+The upstream Norm correction changes rounding order, so new quantized weights
+need their own validation. This dependency upgrade does not add hash-MoE AWQ
+input propagation, mixed-bit calibration, or complete V4.1 calibration support.
+
 Use the main branch unless your workflow requires a pinned tag or commit:
 
 ```bash
