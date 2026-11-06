@@ -55,8 +55,8 @@ release against every supported model.
 
 Upgrade in a separate environment when reproducing earlier calibration results.
 The upstream Norm correction changes rounding order, so new quantized weights
-need their own validation. This dependency upgrade does not add hash-MoE AWQ
-input propagation, mixed-bit calibration, or complete V4.1 calibration support.
+need their own validation. Mixed-bit calibration and complete V4.1 calibration
+support are separate from this dependency baseline.
 
 Use the main branch unless your workflow requires a pinned tag or commit:
 

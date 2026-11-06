@@ -109,6 +109,13 @@ flagos-compressor quantize \
 
 Source FP4 or FP8 weights are staged as BF16 before Transformers loads the calibration model. In Transformers-v5 scenarios, fused experts may be temporarily exposed as per-expert `nn.Linear` modules for calibration.
 
+AWQ records the actual arguments delivered to each inspected submodule. Scale
+search replays each sample with its own attention mask, position embeddings,
+and router token IDs, including positional arguments. This keeps multiple
+calibration samples aligned and supports hash-MoE inputs without treating every
+submodule as attention. Search retains the same aggregate output-MSE objective;
+each candidate executes the original sample calls separately.
+
 ## Control sampling
 
 Use these options to make calibration reproducible:
