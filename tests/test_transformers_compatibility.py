@@ -68,10 +68,17 @@ def test_v4_cache_free_replay_matches_full_model(dtype, device, attention_type):
         model, layer, [batch], device=torch.device("cpu")
     )
     assert samples[0][1].get("past_key_values") is None
+    previous = None
     for _ in range(2):
         actual = forward_layer_samples(layer, samples, device=torch.device(device))[0][0][0]
         assert actual.dtype == reference[0].dtype
-        torch.testing.assert_close(actual, reference[0].cpu(), rtol=0, atol=0)
+        # Calibration prepares positions on CPU; full CUDA forward prepares
+        # them on CUDA. FP32 rotary arithmetic can differ by a few ULPs.
+        tolerance = {"rtol": 1e-5, "atol": 1e-7} if dtype == torch.float32 else {"rtol": 0, "atol": 0}
+        torch.testing.assert_close(actual, reference[0].cpu(), **tolerance)
+        if previous is not None:
+            torch.testing.assert_close(actual, previous, rtol=0, atol=0)
+        previous = actual
 
 
 def test_v4_fp32_norm_preserves_activation_dtype_and_gradients():
