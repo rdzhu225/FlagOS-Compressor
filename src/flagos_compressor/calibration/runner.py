@@ -9,6 +9,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from flagos_compressor.calibration.awq_inputs import AWQCall, AWQReplay
 from flagos_compressor.calibration.mappings import (
     gptq_sequential_groups,
     infer_awq_mappings,
@@ -166,21 +167,6 @@ def _run_samples(
         moved_args = move_to_device(args, device)
         moved_kwargs = move_to_device(sanitize_kwargs(layer, kwargs), device)
         layer(*moved_args, **moved_kwargs)
-
-
-def _forward_kwargs_for_submodule(
-    module: nn.Module,
-    sample_kwargs: dict[str, Any],
-    device: torch.device,
-) -> dict[str, Any]:
-    kwargs = sanitize_kwargs(module, sample_kwargs)
-    # AWQ evaluates a captured attention input repeatedly. Reusing a mutable KV
-    # cache would append the same tokens on every grid-search candidate and can
-    # also mix batch shapes across samples (notably on DeepSeek-V4).
-    for cache_name in ("past_key_values", "past_key_value"):
-        if cache_name in kwargs:
-            kwargs[cache_name] = None
-    return move_to_device(kwargs, device)
 
 
 def _capture_awq_input(
@@ -572,6 +558,9 @@ def quantize_layer_awq(
     features: dict[str, list[torch.Tensor]] = {
         name: [] for name in sorted(feature_names)
     }
+    calls: dict[str, list[AWQCall]] = {
+        mapping.inspect_name: [] for mapping in mappings
+    }
     handles = [
         modules[name].register_forward_pre_hook(
             lambda module, args, kwargs, name=name: _capture_awq_input(
@@ -585,6 +574,15 @@ def quantize_layer_awq(
         )
         for name in sorted(feature_names)
     ]
+    handles.extend(
+        modules[name].register_forward_pre_hook(
+            lambda _module, args, kwargs, name=name: calls[name].append(
+                AWQCall.capture(args, kwargs)
+            ),
+            with_kwargs=True,
+        )
+        for name in calls
+    )
     try:
         _run_samples(layer, samples, device)
     finally:
@@ -604,17 +602,11 @@ def quantize_layer_awq(
         previous = modules[mapping.previous_name]
         search_linears = [linears[name] for name in mapping.quantized_names]
         balance = [modules[name] for name in mapping.linear_names]
-        inspect_module = modules[mapping.inspect_name]
-        kwargs = (
-            _forward_kwargs_for_submodule(inspect_module, samples[0][1], device)
-            if mapping.inspect_name.rsplit(".", 1)[-1] in {"self_attn", "attention", "attn", "linear_attn"}
-            else {}
-        )
+        inspect_module = AWQReplay(modules[mapping.inspect_name], calls[mapping.inspect_name])
         scales = search_awq_scale(
             inspect_module,
             search_linears,
             inputs[mapping.input_name],
-            kwargs=kwargs,
             group_size=int(policy.group_size or 128),
             zero_point=policy.awq.zero_point,
             duo_scaling=policy.awq.duo_scaling,
